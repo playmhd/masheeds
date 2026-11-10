@@ -3,6 +3,7 @@ package com.masheeds.player;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.UriPermission;
 import android.database.Cursor;
 import android.media.MediaMetadataRetriever;
@@ -14,9 +15,14 @@ import android.provider.OpenableColumns;
 import java.io.IOException;
 import java.text.Collator;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 final class TrackLibrary {
+    private static final String REMOVED_TRACKS = "removed_tracks";
+
     record Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified) {
         String displayTitle(Context context) {
             return title.isEmpty() ? context.getString(R.string.untitled_track) : title;
@@ -25,9 +31,11 @@ final class TrackLibrary {
 
     static List<Track> load(Context context, boolean scanDevice) {
         ContentResolver resolver = context.getContentResolver();
+        Set<String> removed = preferences(context).getStringSet(REMOVED_TRACKS, Collections.emptySet());
         List<Track> tracks = new ArrayList<>();
         if (scanDevice) {
             loadDeviceTracks(resolver, tracks);
+            tracks.removeIf(track -> removed.contains(track.libraryUri().toString()));
         }
         for (UriPermission permission : resolver.getPersistedUriPermissions()) {
             if (Thread.currentThread().isInterrupted()) {
@@ -38,7 +46,8 @@ final class TrackLibrary {
                 continue;
             }
             Uri libraryUri = libraryUri(context, uri);
-            if (tracks.stream().anyMatch(track -> libraryUri.equals(track.libraryUri()))) {
+            if (removed.contains(libraryUri.toString())
+                    || tracks.stream().anyMatch(track -> libraryUri.equals(track.libraryUri()))) {
                 continue;
             }
             Track track = readDocument(context, uri, libraryUri);
@@ -53,6 +62,26 @@ final class TrackLibrary {
             return titleOrder != 0 ? titleOrder : collator.compare(left.artist(), right.artist());
         });
         return tracks;
+    }
+
+    static void remove(Context context, Track track) {
+        SharedPreferences preferences = preferences(context);
+        Set<String> removed = new HashSet<>(preferences.getStringSet(REMOVED_TRACKS, Collections.emptySet()));
+        if (removed.add(track.libraryUri().toString())) {
+            preferences.edit().putStringSet(REMOVED_TRACKS, removed).apply();
+        }
+    }
+
+    static void restoreDocument(Context context, Uri document) {
+        SharedPreferences preferences = preferences(context);
+        Set<String> removed = new HashSet<>(preferences.getStringSet(REMOVED_TRACKS, Collections.emptySet()));
+        if (!removed.isEmpty() && removed.remove(libraryUri(context, document).toString())) {
+            preferences.edit().putStringSet(REMOVED_TRACKS, removed).apply();
+        }
+    }
+
+    private static SharedPreferences preferences(Context context) {
+        return context.getSharedPreferences("library", Context.MODE_PRIVATE);
     }
 
     private static void loadDeviceTracks(ContentResolver resolver, List<Track> tracks) {
@@ -107,6 +136,7 @@ final class TrackLibrary {
         } catch (IllegalArgumentException | SecurityException ignored) {
             return null;
         }
+        long albumId = indexedAlbumId(context.getContentResolver(), libraryUri);
         MediaMetadataRetriever retriever = new MediaMetadataRetriever();
         try {
             retriever.setDataSource(context, uri);
@@ -114,9 +144,9 @@ final class TrackLibrary {
             String artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST);
             String duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
             return new Track(uri, libraryUri, title(name, fileName), artist(artist),
-                    duration == null ? 0 : Long.parseLong(duration), 0, 0);
+                    duration == null ? 0 : Long.parseLong(duration), albumId, 0);
         } catch (RuntimeException ignored) {
-            return new Track(uri, libraryUri, title(null, fileName), "", 0, 0, 0);
+            return new Track(uri, libraryUri, title(null, fileName), "", 0, albumId, 0);
         } finally {
             try {
                 retriever.release();
@@ -124,6 +154,21 @@ final class TrackLibrary {
                 // Metadata read above is still usable.
             }
         }
+    }
+
+    private static long indexedAlbumId(ContentResolver resolver, Uri libraryUri) {
+        if (!MediaStore.AUTHORITY.equals(libraryUri.getAuthority())) {
+            return 0;
+        }
+        try (Cursor cursor = resolver.query(libraryUri,
+                new String[]{MediaStore.Audio.Media.ALBUM_ID, MediaStore.Audio.Media.ALBUM}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && hasMetadata(cursor.getString(1))) {
+                return cursor.getLong(0);
+            }
+        } catch (IllegalArgumentException | SecurityException ignored) {
+            // A document grant does not always include access to the corresponding index row.
+        }
+        return 0;
     }
 
     private static String title(String title, String fileName) {

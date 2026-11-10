@@ -25,15 +25,15 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.widget.Toast;
 
 import com.masheeds.player.TrackLibrary.Track;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 
 public final class PlaybackService extends Service {
     private static final String CHANNEL = "playback";
@@ -42,10 +42,21 @@ public final class PlaybackService extends Service {
     private static final String TOGGLE = "toggle";
     private static final String NEXT = "next";
     private static final String DISMISS = "dismiss";
+    private static final long CHECKPOINT_INTERVAL = 2_000L;
 
     private final IBinder binder = new LocalBinder();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable endIdleSession = this::clearSession;
+    private final Runnable timerDeadline = this::checkTimerDeadline;
+    private final Consumer<String> artworkChanged = this::refreshArtwork;
+    private final Runnable checkpointTick = new Runnable() {
+        @Override public void run() {
+            if (playWhenReady) {
+                saveCheckpoint();
+                handler.postDelayed(this, CHECKPOINT_INTERVAL);
+            }
+        }
+    };
     private final AudioAttributes attributes = new AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -71,15 +82,20 @@ public final class PlaybackService extends Service {
     private Future<?> artworkRequest;
     private int artworkVersion;
     private Runnable listener;
-    private List<Track> queue = Collections.emptyList();
+    private final PlaybackQueue queue = new PlaybackQueue();
+    private final SleepTimer sleepTimer = new SleepTimer();
+    private PlaybackCheckpoint lastCheckpoint;
     private RepeatMode repeatMode;
-    private int index = -1;
+    private int requestedSeek = -1;
+    private int activeSeek = -1;
+    private boolean waitingForInitialSeek;
     private boolean prepared;
     private boolean playWhenReady;
     private boolean interrupted;
     private boolean completed;
     private boolean hasFocus;
     private boolean foreground;
+    private boolean hasStartedSession;
     private boolean activityBound;
 
     final class LocalBinder extends Binder {
@@ -91,6 +107,7 @@ public final class PlaybackService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         repeatMode = RepeatMode.load(this);
+        lastCheckpoint = PlaybackCheckpoint.load(this);
         audio = getSystemService(AudioManager.class);
         focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(attributes)
@@ -120,6 +137,7 @@ public final class PlaybackService extends Service {
         } else {
             registerReceiver(headphones, filter);
         }
+        CustomArtwork.addListener(artworkChanged);
     }
 
     @Override public IBinder onBind(Intent intent) {
@@ -134,6 +152,7 @@ public final class PlaybackService extends Service {
 
     @Override public boolean onUnbind(Intent intent) {
         activityBound = false;
+        saveCheckpoint();
         scheduleIdleSessionEnd();
         return true;
     }
@@ -172,7 +191,7 @@ public final class PlaybackService extends Service {
     }
 
     Track currentTrack() {
-        return index >= 0 ? queue.get(index) : null;
+        return queue.current();
     }
 
     Bitmap currentArtwork() {
@@ -184,15 +203,11 @@ public final class PlaybackService extends Service {
     }
 
     boolean canSkipNext() {
-        return index >= 0 && (index + 1 < queue.size() || wrapsQueue());
+        return queue.canNext(repeatMode == RepeatMode.ALL);
     }
 
     boolean canSkipPrevious() {
-        return index > 0 || (index == 0 && wrapsQueue());
-    }
-
-    private boolean wrapsQueue() {
-        return repeatMode == RepeatMode.ALL && queue.size() > 1;
+        return queue.canPrevious(repeatMode == RepeatMode.ALL);
     }
 
     void setRepeatMode(RepeatMode mode) {
@@ -202,25 +217,111 @@ public final class PlaybackService extends Service {
         }
     }
 
+    int sleepTimerMinutes() {
+        return sleepTimer.minutes();
+    }
+
+    boolean sleepTimerEndsWithTrack() {
+        return sleepTimer.endsWithTrack();
+    }
+
+    long sleepTimerRemaining() {
+        return sleepTimer.remaining(SystemClock.elapsedRealtime());
+    }
+
+    void setSleepTimer(int minutes) {
+        if (currentTrack() != null) {
+            handler.removeCallbacks(timerDeadline);
+            sleepTimer.start(minutes, SystemClock.elapsedRealtime());
+            handler.postDelayed(timerDeadline, sleepTimerRemaining());
+            publishState();
+        }
+    }
+
+    void setSleepTimerAtTrackEnd() {
+        if (currentTrack() != null) {
+            handler.removeCallbacks(timerDeadline);
+            sleepTimer.stopAtTrackEnd();
+            publishState();
+        }
+    }
+
+    void cancelSleepTimer() {
+        clearTimer();
+        publishState();
+    }
+
+    private void clearTimer() {
+        handler.removeCallbacks(timerDeadline);
+        sleepTimer.clear();
+    }
+
+    private void checkTimerDeadline() {
+        if (!expireTimerIfDue() && sleepTimer.minutes() > 0) {
+            handler.postDelayed(timerDeadline, sleepTimerRemaining());
+        }
+    }
+
+    private boolean expireTimerIfDue() {
+        if (!sleepTimer.isDue(SystemClock.elapsedRealtime())) {
+            return false;
+        }
+        clearTimer();
+        pause();
+        return true;
+    }
+
     boolean canSeek() {
         return prepared && duration() > 0;
     }
 
     int position() {
-        return prepared ? player.getCurrentPosition() : 0;
+        return requestedSeek >= 0 ? requestedSeek : prepared ? player.getCurrentPosition() : 0;
     }
 
     int duration() {
         return prepared ? Math.max(0, player.getDuration()) : 0;
     }
 
-    void play(List<Track> tracks, int selectedIndex) {
-        queue = new ArrayList<>(tracks);
-        load(selectedIndex);
+    void play(List<Track> tracks, int selectedIndex, String playlistId) {
+        saveCheckpoint();
+        queue.select(tracks, selectedIndex, playlistId);
+        load(true, 0);
     }
 
-    boolean hasQueue(List<Track> tracks) {
-        return queue.equals(tracks);
+    void restore(List<Track> tracks, int selectedIndex, String playlistId, int position) {
+        if (currentTrack() == null) {
+            queue.select(tracks, selectedIndex, playlistId);
+            load(false, position);
+        }
+    }
+
+    boolean hasQueue(List<Track> tracks, String playlistId) {
+        return queue.matches(tracks, playlistId);
+    }
+
+    void updatePlaylist(String id, List<Track> tracks) {
+        if (queue.updatePlaylist(id, tracks)) {
+            publishState();
+        }
+    }
+
+    void detachPlaylist(String id) {
+        if (queue.detachPlaylist(id)) {
+            saveCheckpoint();
+        }
+    }
+
+    void removeTrack(String trackId) {
+        Track current = currentTrack();
+        if (current != null && current.libraryUri().toString().equals(trackId)) {
+            clearSession();
+        } else if (queue.removeTrack(trackId)) {
+            publishState();
+        }
+        if (lastCheckpoint != null && lastCheckpoint.trackId().equals(trackId)) {
+            lastCheckpoint = null;
+        }
     }
 
     void toggle() {
@@ -233,7 +334,9 @@ public final class PlaybackService extends Service {
 
     void previous() {
         if (canSkipPrevious() && position() < 3_000) {
-            load(index == 0 ? queue.size() - 1 : index - 1);
+            saveCheckpoint();
+            queue.previous();
+            load(true, 0);
         } else {
             seek(0);
         }
@@ -241,7 +344,9 @@ public final class PlaybackService extends Service {
 
     void next() {
         if (canSkipNext()) {
-            load((index + 1) % queue.size());
+            saveCheckpoint();
+            queue.next();
+            load(true, 0);
         }
     }
 
@@ -250,17 +355,26 @@ public final class PlaybackService extends Service {
             return;
         }
         completed = false;
-        player.seekTo(Math.max(0, Math.min(position, duration())), MediaPlayer.SEEK_CLOSEST);
+        requestedSeek = (int) Math.max(0, Math.min(position, duration()));
+        if (activeSeek < 0) {
+            seekToRequestedPosition();
+        }
+        saveCheckpoint();
         publishState();
     }
 
-    private void load(int selectedIndex) {
+    private void seekToRequestedPosition() {
+        activeSeek = requestedSeek;
+        player.seekTo(activeSeek, MediaPlayer.SEEK_CLOSEST);
+    }
+
+    private void load(boolean autoplay, int position) {
         releasePlayer();
-        index = selectedIndex;
-        playWhenReady = true;
+        playWhenReady = autoplay;
+        requestedSeek = position > 0 ? position : -1;
         interrupted = false;
         completed = false;
-        if (!enterForeground()) {
+        if (autoplay && !enterForeground()) {
             failPlayback();
             return;
         }
@@ -275,6 +389,15 @@ public final class PlaybackService extends Service {
                     return;
                 }
                 prepared = true;
+                if (requestedSeek > 0 && requestedSeek < duration()) {
+                    waitingForInitialSeek = true;
+                    seekToRequestedPosition();
+                    saveCheckpoint();
+                    publishState();
+                    return;
+                }
+                requestedSeek = -1;
+                saveCheckpoint();
                 if (playWhenReady) {
                     startPlayback();
                 } else {
@@ -282,7 +405,21 @@ public final class PlaybackService extends Service {
                 }
             });
             newPlayer.setOnSeekCompleteListener(seeked -> {
-                if (seeked == player) {
+                if (seeked != player) {
+                    return;
+                }
+                if (requestedSeek != activeSeek) {
+                    seekToRequestedPosition();
+                    return;
+                }
+                activeSeek = -1;
+                requestedSeek = -1;
+                boolean start = waitingForInitialSeek && playWhenReady;
+                waitingForInitialSeek = false;
+                saveCheckpoint();
+                if (start) {
+                    startPlayback();
+                } else {
                     publishState();
                 }
             });
@@ -305,12 +442,20 @@ public final class PlaybackService extends Service {
     private void loadArtwork(Track track) {
         int version = artworkVersion;
         artworkRequest = ArtworkLoader.load(this, track, ArtworkLoader.COVER_SIZE, bitmap -> {
-            if (version == artworkVersion && bitmap != null) {
+            if (version == artworkVersion && currentArtwork != bitmap) {
                 currentArtwork = bitmap;
-                notificationArtwork = ArtworkLoader.fit(bitmap, 256);
+                notificationArtwork = bitmap == null ? null : ArtworkLoader.fit(bitmap, 256);
                 publishState();
             }
         });
+    }
+
+    private void refreshArtwork(String key) {
+        Track track = currentTrack();
+        if (track != null && (key.equals(CustomArtwork.trackKey(track)) || key.equals(CustomArtwork.albumKey(track)))) {
+            cancelArtworkRequest();
+            loadArtwork(track);
+        }
     }
 
     private void onTrackCompleted(MediaPlayer finished) {
@@ -318,10 +463,19 @@ public final class PlaybackService extends Service {
             return;
         }
         completed = true;
+        saveCheckpoint();
+        if (sleepTimer.endsWithTrack()) {
+            clearTimer();
+            pause();
+            return;
+        }
+        if (expireTimerIfDue()) {
+            return;
+        }
         if (!playWhenReady) {
             return;
         }
-        if (repeatMode == RepeatMode.ONE || (repeatMode == RepeatMode.ALL && queue.size() == 1)) {
+        if (repeatMode == RepeatMode.ONE || (repeatMode == RepeatMode.ALL && queue.repeatsOnlyTrack())) {
             startPlayback();
         } else if (canSkipNext()) {
             next();
@@ -334,13 +488,16 @@ public final class PlaybackService extends Service {
         if (player == null || playWhenReady) {
             return;
         }
+        if (sleepTimer.isDue(SystemClock.elapsedRealtime())) {
+            clearTimer();
+        }
         if (!enterForeground()) {
             Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
             return;
         }
         interrupted = false;
         playWhenReady = true;
-        if (prepared) {
+        if (prepared && !waitingForInitialSeek) {
             startPlayback();
         } else {
             publishState();
@@ -348,6 +505,9 @@ public final class PlaybackService extends Service {
     }
 
     private void startPlayback() {
+        if (expireTimerIfDue()) {
+            return;
+        }
         if (!hasFocus) {
             hasFocus = audio.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
             if (!hasFocus) {
@@ -357,11 +517,11 @@ public final class PlaybackService extends Service {
             }
         }
         try {
-            if (completed) {
-                completed = false;
-                player.seekTo(0, MediaPlayer.SEEK_CLOSEST);
-            }
             player.start();
+            completed = false;
+            queue.visitCurrent();
+            handler.removeCallbacks(checkpointTick);
+            handler.postDelayed(checkpointTick, CHECKPOINT_INTERVAL);
             publishState();
         } catch (IllegalStateException error) {
             failPlayback();
@@ -375,6 +535,8 @@ public final class PlaybackService extends Service {
         interrupted = false;
         playWhenReady = false;
         pausePlayer();
+        handler.removeCallbacks(checkpointTick);
+        saveCheckpoint();
         abandonFocus();
         leaveForeground(STOP_FOREGROUND_DETACH);
         scheduleIdleSessionEnd();
@@ -406,11 +568,13 @@ public final class PlaybackService extends Service {
                     interrupted = true;
                     playWhenReady = false;
                     pausePlayer();
+                    handler.removeCallbacks(checkpointTick);
+                    saveCheckpoint();
                     publishState();
                 }
             }
             case AudioManager.AUDIOFOCUS_GAIN -> {
-                if (interrupted) {
+                if (interrupted && !expireTimerIfDue()) {
                     resume();
                 }
             }
@@ -426,6 +590,7 @@ public final class PlaybackService extends Service {
             startForegroundService(new Intent(this, PlaybackService.class));
             startForeground(NOTIFICATION_ID, notification(true));
             foreground = true;
+            hasStartedSession = true;
             return true;
         } catch (IllegalStateException | SecurityException error) {
             return false;
@@ -447,9 +612,9 @@ public final class PlaybackService extends Service {
             session.setActive(false);
             session.setMetadata(null);
             session.setPlaybackState(null);
-        } else {
+        } else if (hasStartedSession) {
             int state = playWhenReady
-                    ? (prepared ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_BUFFERING)
+                    ? (prepared && !waitingForInitialSeek ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_BUFFERING)
                     : PlaybackState.STATE_PAUSED;
             long actions = PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_PLAY
                     | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_SKIP_TO_PREVIOUS
@@ -518,17 +683,23 @@ public final class PlaybackService extends Service {
     }
 
     private void failPlayback() {
+        boolean showError = hasStartedSession || playWhenReady;
+        prepared = false;
         clearSession();
-        Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
+        if (showError) {
+            Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void clearSession() {
+        saveCheckpoint();
         handler.removeCallbacks(endIdleSession);
+        clearTimer();
         playWhenReady = false;
         interrupted = false;
         completed = false;
-        index = -1;
-        queue = Collections.emptyList();
+        hasStartedSession = false;
+        queue.clear();
         releasePlayer();
         abandonFocus();
         leaveForeground(STOP_FOREGROUND_REMOVE);
@@ -537,18 +708,45 @@ public final class PlaybackService extends Service {
         stopSelf();
     }
 
+    private void saveCheckpoint() {
+        Track track = currentTrack();
+        if (!prepared || track == null) {
+            return;
+        }
+        int savedPosition;
+        try {
+            savedPosition = completed ? 0 : Math.max(0, position());
+        } catch (IllegalStateException ignored) {
+            return;
+        }
+        PlaybackCheckpoint checkpoint = new PlaybackCheckpoint(
+                track.libraryUri().toString(), savedPosition, queue.playlistId());
+        if (!checkpoint.equals(lastCheckpoint)) {
+            checkpoint.save(this);
+            lastCheckpoint = checkpoint;
+        }
+    }
+
     private void releasePlayer() {
+        handler.removeCallbacks(checkpointTick);
+        cancelArtworkRequest();
+        currentArtwork = null;
+        notificationArtwork = null;
+        prepared = false;
+        requestedSeek = -1;
+        activeSeek = -1;
+        waitingForInitialSeek = false;
+        if (player != null) {
+            player.release();
+            player = null;
+        }
+    }
+
+    private void cancelArtworkRequest() {
         artworkVersion++;
         if (artworkRequest != null) {
             artworkRequest.cancel(false);
             artworkRequest = null;
-        }
-        currentArtwork = null;
-        notificationArtwork = null;
-        prepared = false;
-        if (player != null) {
-            player.release();
-            player = null;
         }
     }
 
@@ -566,6 +764,8 @@ public final class PlaybackService extends Service {
     }
 
     @Override public void onDestroy() {
+        CustomArtwork.removeListener(artworkChanged);
+        saveCheckpoint();
         handler.removeCallbacksAndMessages(null);
         unregisterReceiver(headphones);
         releasePlayer();

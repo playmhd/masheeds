@@ -32,9 +32,11 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.BaseAdapter;
@@ -48,6 +50,7 @@ import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.window.OnBackInvokedCallback;
@@ -60,6 +63,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -70,6 +74,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
@@ -78,14 +83,17 @@ import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 public final class MainActivity extends Activity {
     private static final int PLAYER = 0xFF173D30;
     private static final int PLAYER_MUTED = 0xFFC5D9CB;
+    private static final int THUMBNAIL_DP = 48;
     private static final int PICK_FILES = 1;
     private static final int AUDIO_ACCESS = 2;
+    private static final int PICK_COVER = 3;
 
-    private enum Screen { LIBRARY, PLAYLISTS, SETTINGS, PLAYER }
+    private enum Screen { LIBRARY, PLAYLISTS, DISCOVER, SETTINGS, PLAYER }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService scanner = Executors.newSingleThreadExecutor();
     private final Runnable scan = this::refreshLibrary;
+    private final Consumer<String> artworkChanged = key -> refreshArtworkRows();
     private final Runnable progressUpdate = new Runnable() {
         @Override public void run() {
             updateProgress();
@@ -104,6 +112,7 @@ public final class MainActivity extends Activity {
             playback.refreshLanguage();
             playback.setRepeatMode(repeatMode);
             playback.setListener(MainActivity.this::renderPlayback);
+            maybeRestorePlayback();
             renderPlayback();
         }
 
@@ -130,6 +139,10 @@ public final class MainActivity extends Activity {
     private boolean observing;
     private boolean scrubbing;
     private boolean loaded;
+    private boolean restoreLibraryReady;
+    private boolean restoreAttempted;
+    private String pendingCoverKey;
+    private long coverRevision;
     private boolean keyboardOpen;
     private OnBackInvokedCallback backCallback;
     private Future<?> scanTask;
@@ -147,7 +160,6 @@ public final class MainActivity extends Activity {
     private LinearLayout trackHeading;
     private EditText search;
     private TextView count;
-    private Button scanButton;
     private TrackAdapter adapter;
     private ListView trackList;
     private ScrollView placeholder;
@@ -155,7 +167,6 @@ public final class MainActivity extends Activity {
     private ImageView emptyIcon;
     private TextView emptyTitle;
     private TextView emptyMessage;
-    private Button emptyAction;
     private LinearLayout miniPlayer;
     private LinearLayout miniDetails;
     private ImageView miniArtwork;
@@ -175,6 +186,11 @@ public final class MainActivity extends Activity {
     private ImageButton playerNext;
     private ImageButton playerPrevious;
     private ImageButton playerRepeat;
+    private ImageButton playerTimer;
+    private TextView timerStatus;
+    private Button cancelTimer;
+    private BaseAdapter timerChoices;
+    private LinearLayout discoverScreen;
     private ScrollView settingsScreen;
     private TextView audioAccessSummary;
 
@@ -222,14 +238,16 @@ public final class MainActivity extends Activity {
         showScreen(Screen.LIBRARY);
         setContentView(root);
         if (state != null) {
+            pendingCoverKey = state.getString("pendingCover");
             search.setText(state.getString("query", ""));
             String savedScreen = state.getString("screen");
             String savedTab = state.getString("tab", savedScreen);
             playlistPage.restoreSelection(state.getString("playlist"));
-            if (Screen.PLAYLISTS.name().equals(savedTab)) {
-                showScreen(Screen.PLAYLISTS);
-            } else if (Screen.SETTINGS.name().equals(savedTab)) {
-                showScreen(Screen.SETTINGS);
+            for (Screen destination : navigationButtons.keySet()) {
+                if (destination.name().equals(savedTab)) {
+                    showScreen(destination);
+                    break;
+                }
             }
             int scroll = state.getInt("settingsScroll");
             settingsScreen.post(() -> settingsScreen.scrollTo(0, scroll));
@@ -264,6 +282,10 @@ public final class MainActivity extends Activity {
 
     @Override public void onStart() {
         super.onStart();
+        CustomArtwork.addListener(artworkChanged);
+        refreshArtworkRows();
+        restoreLibraryReady = false;
+        restoreAttempted = false;
         bound = bindService(new Intent(this, PlaybackService.class), connection, Context.BIND_AUTO_CREATE);
         handler.post(progressUpdate);
     }
@@ -284,6 +306,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override public void onStop() {
+        CustomArtwork.removeListener(artworkChanged);
         handler.removeCallbacks(progressUpdate);
         handler.removeCallbacks(scan);
         if (observing) {
@@ -308,6 +331,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override public void onSaveInstanceState(Bundle state) {
+        state.putString("pendingCover", pendingCoverKey);
         state.putString("query", search.getText().toString());
         state.putString("screen", screen.name());
         state.putString("tab", tab.name());
@@ -332,9 +356,11 @@ public final class MainActivity extends Activity {
         shell.addView(pages, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
         library = buildLibrary();
         playlistPage = new PlaylistPage();
+        discoverScreen = buildDiscoverScreen();
         settingsScreen = buildSettingsScreen();
         pages.addView(library, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(playlistPage, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        pages.addView(discoverScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(settingsScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
 
         miniPlayer = buildMiniPlayer();
@@ -348,6 +374,7 @@ public final class MainActivity extends Activity {
         bottomNavigation.setBackgroundColor(surface);
         addNavigationButton(Screen.LIBRARY, R.string.library_settings, R.drawable.ic_tracks);
         addNavigationButton(Screen.PLAYLISTS, R.string.playlists, R.drawable.ic_playlists);
+        addNavigationButton(Screen.DISCOVER, R.string.discover, R.drawable.ic_discover);
         addNavigationButton(Screen.SETTINGS, R.string.settings, R.drawable.ic_settings);
         shell.addView(bottomNavigation, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
         return shell;
@@ -361,6 +388,11 @@ public final class MainActivity extends Activity {
         navigation.setPadding(dp(4), dp(6), dp(4), dp(6));
         navigation.setMinimumHeight(dp(56));
         navigation.setOnClickListener(view -> {
+            if (screen != destination && AppPreferences.navigationHapticsEnabled(this)) {
+                int feedback = Build.VERSION.SDK_INT >= 34
+                        ? HapticFeedbackConstants.SEGMENT_TICK : HapticFeedbackConstants.CLOCK_TICK;
+                view.performHapticFeedback(feedback);
+            }
             if (screen == Screen.PLAYLISTS && destination == Screen.PLAYLISTS) {
                 playlistPage.closePlaylist();
             }
@@ -436,9 +468,6 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams countSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
         countSize.setMarginStart(dp(10));
         trackHeading.addView(count, countSize);
-        scanButton = button(R.string.scan_device, accent, Color.TRANSPARENT);
-        scanButton.setOnClickListener(view -> requestAudioAccess());
-        trackHeading.addView(scanButton, new LinearLayout.LayoutParams(WRAP_CONTENT, dp(48)));
         trackHeading.setVisibility(View.GONE);
         addWithMargin(page, trackHeading, MATCH_PARENT, dp(48), 6);
 
@@ -447,7 +476,12 @@ public final class MainActivity extends Activity {
         trackList = styledList();
         adapter = new TrackAdapter();
         trackList.setAdapter(adapter);
-        trackList.setOnItemClickListener((parent, row, position, id) -> selectTrack(tracks, adapter.getItem(position)));
+        trackList.setOnItemClickListener((parent, row, position, id) -> selectTrack(tracks, adapter.getItem(position), null));
+        trackList.setOnItemLongClickListener((parent, row, position, id) -> {
+            hideKeyboard();
+            openTrackMenu(adapter.getItem(position), null);
+            return true;
+        });
         trackList.setVisibility(View.GONE);
         results.addView(trackList, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         placeholder = buildPlaceholder();
@@ -463,11 +497,15 @@ public final class MainActivity extends Activity {
 
     private ListView styledList() {
         ListView list = new ListView(this);
+        styleList(list);
+        return list;
+    }
+
+    private void styleList(ListView list) {
         list.setDivider(null);
         list.setClipToPadding(false);
         list.setPadding(0, 0, 0, dp(6));
         list.setSelector(android.R.color.transparent);
-        return list;
     }
 
     private ScrollView buildPlaceholder() {
@@ -485,14 +523,11 @@ public final class MainActivity extends Activity {
         emptyTitle = text(0, 23, ink, true);
         emptyTitle.setGravity(Gravity.CENTER);
         addWithMargin(panel, emptyTitle, MATCH_PARENT, WRAP_CONTENT, 18);
-        emptyMessage = text(0, 15, muted, false);
+        emptyMessage = text(R.string.no_matches_description, 15, muted, false);
         emptyMessage.setGravity(Gravity.CENTER);
         emptyMessage.setMaxWidth(dp(290));
         emptyMessage.setLineSpacing(dp(3), 1);
         addWithMargin(panel, emptyMessage, WRAP_CONTENT, WRAP_CONTENT, 6);
-        emptyAction = button(R.string.scan_device, onAccent, accent);
-        emptyAction.setOnClickListener(view -> requestAudioAccess());
-        addWithMargin(panel, emptyAction, WRAP_CONTENT, dp(48), 18);
         return scroll;
     }
 
@@ -509,7 +544,8 @@ public final class MainActivity extends Activity {
         miniDetails.setOnClickListener(view -> openPlayer());
         controls.addView(miniDetails, new LinearLayout.LayoutParams(0, dp(50), 1));
         miniArtwork = artworkTile(0xFF315647, 10);
-        miniDetails.addView(miniArtwork, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        int thumbnailSize = dp(THUMBNAIL_DP);
+        miniDetails.addView(miniArtwork, new LinearLayout.LayoutParams(thumbnailSize, thumbnailSize));
         LinearLayout labels = column();
         LinearLayout.LayoutParams labelSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
         labelSize.setMarginStart(dp(10));
@@ -547,6 +583,9 @@ public final class MainActivity extends Activity {
         ImageButton close = iconButton(R.drawable.ic_down, R.string.close_player, accent, accentSurface,
                 48, 24, this::goBack);
         addHeaderButton(header, close, Gravity.START);
+        playerTimer = iconButton(R.drawable.ic_timer, R.string.sleep_timer, accent, accentSurface,
+                48, 24, this::openSleepTimer);
+        addHeaderButton(header, playerTimer, Gravity.END);
         page.addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
 
         int width = getResources().getConfiguration().screenWidthDp;
@@ -554,7 +593,16 @@ public final class MainActivity extends Activity {
         int coverSize = dp(Math.min(320, Math.min(width - 48, Math.max(144, height - 330))));
         playerArtwork = artworkTile(accentSurface, 28);
         playerArtwork.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        addWithMargin(page, playerArtwork, coverSize, coverSize, 22);
+        FrameLayout coverPanel = new FrameLayout(this);
+        coverPanel.addView(playerArtwork, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        ImageButton addToPlaylist = iconButton(R.drawable.ic_add_to_playlist, R.string.add_to_playlist,
+                accent, accentSurface, 48, 22, this::openAddToPlaylist);
+        FrameLayout.LayoutParams actionPosition =
+                new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.BOTTOM);
+        actionPosition.setMarginEnd(dp(10));
+        actionPosition.bottomMargin = dp(10);
+        coverPanel.addView(addToPlaylist, actionPosition);
+        addWithMargin(page, coverPanel, coverSize, coverSize, 22);
 
         playerTitle = text(0, 27, ink, true);
         playerTitle.setGravity(Gravity.CENTER);
@@ -625,6 +673,18 @@ public final class MainActivity extends Activity {
         return screen;
     }
 
+    private LinearLayout buildDiscoverScreen() {
+        LinearLayout page = column();
+        page.setPadding(dp(20), dp(6), dp(20), dp(10));
+        page.addView(screenHeader(text(R.string.discover, 16, ink, true)),
+                new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
+
+        TextView message = text(R.string.discover_placeholder, 15, muted, false);
+        message.setGravity(Gravity.CENTER);
+        page.addView(message, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+        return page;
+    }
+
     private ScrollView buildSettingsScreen() {
         ScrollView settings = new ScrollView(this);
         settings.setFillViewport(true);
@@ -661,6 +721,19 @@ public final class MainActivity extends Activity {
                 }));
         preferencesCard.addView(languageButton, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
 
+        Switch haptics = new Switch(this);
+        haptics.setText(R.string.navigation_haptics);
+        haptics.setTextColor(ink);
+        haptics.setTextSize(14);
+        haptics.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        haptics.setMinHeight(dp(48));
+        haptics.setPaddingRelative(dp(13), 0, dp(13), 0);
+        haptics.setSwitchPadding(dp(12));
+        haptics.setBackground(ripple(Color.TRANSPARENT, 14));
+        haptics.setChecked(AppPreferences.navigationHapticsEnabled(this));
+        haptics.setOnCheckedChangeListener((view, enabled) -> AppPreferences.setNavigationHapticsEnabled(this, enabled));
+        preferencesCard.addView(haptics, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+
         TextView librarySection = text(R.string.library_settings, 18, ink, true);
         markHeading(librarySection);
         addWithMargin(page, librarySection, MATCH_PARENT, WRAP_CONTENT, 24);
@@ -670,15 +743,12 @@ public final class MainActivity extends Activity {
         addWithMargin(page, accessCard, MATCH_PARENT, WRAP_CONTENT, 10);
         audioAccessSummary = text(0, 15, muted, false);
         accessCard.addView(audioAccessSummary);
+        Button scanButton = button(R.string.scan_device, onAccent, accent);
+        scanButton.setOnClickListener(view -> scanDevice());
+        addWithMargin(accessCard, scanButton, WRAP_CONTENT, dp(48), 12);
         Button audioAccess = button(R.string.audio_access, accent, accentSurface);
-        audioAccess.setOnClickListener(view -> {
-            if (hasAudioAccess()) {
-                openAppSettings();
-            } else {
-                requestAudioAccess();
-            }
-        });
-        addWithMargin(accessCard, audioAccess, WRAP_CONTENT, dp(48), 12);
+        audioAccess.setOnClickListener(view -> openAppSettings());
+        addWithMargin(accessCard, audioAccess, WRAP_CONTENT, dp(48), 8);
 
         TextView version = text(0, 14, muted, false);
         version.setText(getString(R.string.app_version, BuildConfig.VERSION_NAME));
@@ -714,8 +784,10 @@ public final class MainActivity extends Activity {
         FrameLayout header = new FrameLayout(this);
         markHeading(label);
         label.setGravity(Gravity.CENTER);
-        FrameLayout.LayoutParams size = new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER);
-        size.setMargins(dp(54), 0, dp(54), 0);
+        FrameLayout.LayoutParams size = new FrameLayout.LayoutParams(
+                MATCH_PARENT, WRAP_CONTENT, Gravity.START | Gravity.CENTER_VERTICAL);
+        size.setMarginStart(dp(54));
+        size.setMarginEnd(dp(54));
         header.addView(label, size);
         return header;
     }
@@ -762,6 +834,14 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_COVER) {
+            String key = pendingCoverKey;
+            pendingCoverKey = null;
+            if (key != null && resultCode == RESULT_OK && data != null && data.getData() != null) {
+                updateCover(key, data.getData());
+            }
+            return;
+        }
         if (requestCode != PICK_FILES || resultCode != RESULT_OK || data == null) {
             return;
         }
@@ -780,12 +860,101 @@ public final class MainActivity extends Activity {
         refreshLibrary();
     }
 
+    private void openTrackMenu(Track track, Playlist playlist) {
+        String trackKey = CustomArtwork.trackKey(track);
+        MasheedsDialog dialog = new MasheedsDialog(this, track.displayTitle(this));
+        dialog.addMenuItem(R.string.set_track_cover, () -> {
+            dialog.dismiss();
+            openCoverPicker(trackKey);
+        });
+        if (playlist != null) {
+            String albumKey = CustomArtwork.albumKey(track);
+            if (CustomArtwork.hasCover(this, trackKey)) {
+                dialog.addMenuItem(R.string.remove_track_cover, () -> {
+                    dialog.dismiss();
+                    updateCover(trackKey, null);
+                });
+            }
+            if (CustomArtwork.hasCover(this, albumKey)) {
+                dialog.addMenuItem(R.string.remove_album_cover, () -> {
+                    dialog.dismiss();
+                    updateCover(albumKey, null);
+                });
+            }
+            dialog.addMenuItem(R.string.remove_from_playlist, () -> {
+                dialog.dismiss();
+                playlistPage.confirmRemoveTrack(playlist, track);
+            });
+        } else {
+            dialog.addMenuItem(R.string.delete_track, () -> {
+                dialog.dismiss();
+                confirmDeleteTrack(track);
+            });
+        }
+        dialog.addCancel();
+        dialog.show();
+    }
+
+    private void confirmDeleteTrack(Track track) {
+        MasheedsDialog dialog = new MasheedsDialog(this, getText(R.string.delete_track));
+        dialog.addMessage(getString(R.string.delete_track_message, track.displayTitle(this)));
+        dialog.addCancel();
+        dialog.addAction(R.string.delete_track, true, () -> {
+            String trackId = track.libraryUri().toString();
+            TrackLibrary.remove(this, track);
+            playlistPage.removeTrackFromAll(trackId);
+            withPlayback(service -> service.removeTrack(trackId));
+            PlaybackCheckpoint.forgetTrack(this, trackId);
+
+            List<Track> remaining = new ArrayList<>(tracks);
+            remaining.removeIf(item -> item.libraryUri().equals(track.libraryUri()));
+            showLibraryTracks(remaining);
+            refreshLibrary();
+            dialog.dismiss();
+        });
+        dialog.show();
+    }
+
+    private void openCoverPicker(String key) {
+        pendingCoverKey = key;
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("image/*")
+                .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(picker, PICK_COVER);
+        } catch (ActivityNotFoundException error) {
+            pendingCoverKey = null;
+            Toast.makeText(this, R.string.picker_error, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void updateCover(String key, Uri image) {
+        CustomArtwork.update(this, key, image, success -> {
+            if (!success && !isDestroyed()) {
+                Toast.makeText(this, R.string.cover_update_error, Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    private void refreshArtworkRows() {
+        long revision = CustomArtwork.revision();
+        if (coverRevision != revision) {
+            coverRevision = revision;
+            adapter.notifyDataSetChanged();
+            playlistPage.trackAdapter.notifyDataSetChanged();
+            playlistPage.playlistAdapter.notifyDataSetChanged();
+        }
+    }
+
     private boolean rememberFile(Uri uri) {
         if (uri == null) {
             return false;
         }
         try {
             getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            TrackLibrary.restoreDocument(this, uri);
             return true;
         } catch (SecurityException error) {
             return false;
@@ -806,8 +975,11 @@ public final class MainActivity extends Activity {
                 && !shouldShowRequestPermissionRationale(audioPermission());
     }
 
-    private void requestAudioAccess() {
-        if (requiresPermissionSettings()) {
+    private void scanDevice() {
+        if (hasAudioAccess()) {
+            refreshLibrary();
+            showScreen(Screen.LIBRARY);
+        } else if (requiresPermissionSettings()) {
             openAppSettings();
         } else {
             requestPermissions(new String[]{audioPermission()}, AUDIO_ACCESS);
@@ -826,6 +998,9 @@ public final class MainActivity extends Activity {
             renderAudioAccess();
             watchDeviceLibrary();
             refreshLibrary();
+            if (results[0] == PackageManager.PERMISSION_GRANTED) {
+                showScreen(Screen.LIBRARY);
+            }
         }
     }
 
@@ -840,13 +1015,19 @@ public final class MainActivity extends Activity {
             List<Track> found = TrackLibrary.load(app, scanDevice);
             handler.post(() -> {
                 if (!isDestroyed() && version == scanVersion) {
-                    tracks = found;
-                    loaded = true;
-                    renderLibrary();
-                    playlistPage.render();
+                    restoreLibraryReady = true;
+                    showLibraryTracks(found);
+                    maybeRestorePlayback();
                 }
             });
         });
+    }
+
+    private void showLibraryTracks(List<Track> available) {
+        tracks = available;
+        loaded = true;
+        renderLibrary();
+        playlistPage.updateLibrary(available);
     }
 
     private void renderLibrary() {
@@ -864,12 +1045,8 @@ public final class MainActivity extends Activity {
         adapter.visible = visible;
         adapter.notifyDataSetChanged();
         boolean hasTracks = !tracks.isEmpty();
-        boolean hasAccess = hasAudioAccess();
-        int scanLabel = requiresPermissionSettings() ? R.string.open_settings : R.string.scan_device;
         search.setVisibility(hasTracks ? View.VISIBLE : View.GONE);
         trackHeading.setVisibility(hasTracks ? View.VISIBLE : View.GONE);
-        scanButton.setVisibility(hasAccess ? View.GONE : View.VISIBLE);
-        scanButton.setText(scanLabel);
         int countLabel = query.isEmpty() ? R.plurals.track_count : R.plurals.match_count;
         count.setText(getResources().getQuantityString(countLabel, visible.size(), visible.size()));
         loading.setVisibility(View.GONE);
@@ -877,24 +1054,61 @@ public final class MainActivity extends Activity {
         placeholder.setVisibility(visible.isEmpty() ? View.VISIBLE : View.GONE);
         if (visible.isEmpty()) {
             emptyIcon.setVisibility(hasTracks ? View.GONE : View.VISIBLE);
-            emptyTitle.setText(hasTracks ? R.string.no_matches_title
-                    : hasAccess ? R.string.empty_title : R.string.welcome_title);
-            emptyMessage.setText(hasTracks ? R.string.no_matches_description
-                    : hasAccess ? R.string.empty_description : R.string.welcome_description);
-            emptyAction.setVisibility(!hasTracks && !hasAccess ? View.VISIBLE : View.GONE);
-            emptyAction.setText(scanLabel);
+            emptyTitle.setText(hasTracks ? R.string.no_matches_title : R.string.empty_title);
+            emptyMessage.setVisibility(hasTracks ? View.VISIBLE : View.GONE);
         }
     }
 
-    private void selectTrack(List<Track> queue, Track track) {
+    private void maybeRestorePlayback() {
+        if (playback == null || restoreAttempted) {
+            return;
+        }
+        if (playback.currentTrack() != null) {
+            restoreAttempted = true;
+            return;
+        }
+        if (!restoreLibraryReady) {
+            return;
+        }
+        PlaybackCheckpoint checkpoint = PlaybackCheckpoint.load(this);
+        if (checkpoint == null) {
+            restoreAttempted = true;
+            return;
+        }
+        Playlist playlist = playlistPage.findPlaylist(checkpoint.playlistId());
+        List<Track> queue = playlist == null ? tracks : playlistPage.resolveTracks(playlist);
+        int index = trackIndex(queue, checkpoint.trackId());
+        if (index < 0 && playlist != null) {
+            playlist = null;
+            queue = tracks;
+            index = trackIndex(queue, checkpoint.trackId());
+        }
+        if (index >= 0) {
+            restoreAttempted = true;
+            playback.restore(queue, index, playlist == null ? null : playlist.id(), checkpoint.position());
+        }
+    }
+
+    private static int trackIndex(List<Track> queue, String trackId) {
+        for (int index = 0; index < queue.size(); index++) {
+            if (queue.get(index).libraryUri().toString().equals(trackId)) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    private void selectTrack(List<Track> queue, Track track, String playlistId) {
         if (playback == null) {
             return;
         }
+        restoreAttempted = true;
         hideKeyboard();
-        if (track.uri().equals(selectedTrack) && playback.hasQueue(queue)) {
+        Track current = playback.currentTrack();
+        if (current != null && track.libraryUri().equals(current.libraryUri()) && playback.hasQueue(queue, playlistId)) {
             playback.toggle();
         } else {
-            playback.play(queue, queue.indexOf(track));
+            playback.play(queue, queue.indexOf(track), playlistId);
         }
     }
 
@@ -910,6 +1124,11 @@ public final class MainActivity extends Activity {
         Bitmap artwork = current == null ? null : playback.currentArtwork();
         displayArtwork(miniArtwork, artwork, R.drawable.ic_note, PLAYER_MUTED, 10);
         displayArtwork(playerArtwork, artwork, R.drawable.ic_record, null, 8);
+        boolean timerActive = sleepTimerActive();
+        playerTimer.setBackground(ripple(timerActive ? accent : accentSurface, 24));
+        playerTimer.setColorFilter(timerActive ? onAccent : accent);
+        playerTimer.setContentDescription(getString(timerActive ? R.string.sleep_timer_active : R.string.sleep_timer));
+        updateTimerStatus();
         if (current == null) {
             if (screen == Screen.PLAYER) {
                 showScreen(tab);
@@ -938,6 +1157,7 @@ public final class MainActivity extends Activity {
     }
 
     private void updateProgress() {
+        updateTimerStatus();
         if (playback == null || playback.currentTrack() == null) {
             return;
         }
@@ -955,6 +1175,75 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private boolean sleepTimerActive() {
+        return playback != null && (playback.sleepTimerMinutes() > 0 || playback.sleepTimerEndsWithTrack());
+    }
+
+    private void openAddToPlaylist() {
+        Track track = playback == null ? null : playback.currentTrack();
+        if (track != null) {
+            playlistPage.addTrack(track);
+        }
+    }
+
+    private void openSleepTimer() {
+        if (playback == null || playback.currentTrack() == null) {
+            return;
+        }
+        MasheedsDialog dialog = new MasheedsDialog(this, getText(R.string.sleep_timer));
+        TextView statusView = dialog.addMessage("");
+        timerStatus = statusView;
+        int[] durations = {15, 30, 60};
+        CharSequence[] labels = new CharSequence[durations.length + 1];
+        for (int index = 0; index < durations.length; index++) {
+            int minutes = durations[index];
+            labels[index] = getResources().getQuantityString(R.plurals.sleep_timer_minutes, minutes, minutes);
+        }
+        labels[durations.length] = getText(R.string.sleep_timer_end);
+        timerChoices = dialog.addRadioOptions(labels, index -> playback != null && (index == durations.length
+                ? playback.sleepTimerEndsWithTrack() : playback.sleepTimerMinutes() == durations[index]), index -> {
+                    if (index == durations.length) {
+                        withPlayback(PlaybackService::setSleepTimerAtTrackEnd);
+                    } else {
+                        withPlayback(service -> service.setSleepTimer(durations[index]));
+                    }
+                    dialog.dismiss();
+                });
+        dialog.addCancel();
+        cancelTimer = dialog.addAction(R.string.sleep_timer_cancel, false, () -> {
+            withPlayback(PlaybackService::cancelSleepTimer);
+            dialog.dismiss();
+        });
+        dialog.setOnDismissListener(ignored -> {
+            if (timerStatus == statusView) {
+                timerStatus = null;
+                cancelTimer = null;
+                timerChoices = null;
+            }
+        });
+        updateTimerStatus();
+        dialog.show();
+    }
+
+    private void updateTimerStatus() {
+        if (timerStatus == null) {
+            return;
+        }
+        String status = getString(R.string.sleep_timer_off);
+        if (sleepTimerActive()) {
+            status = playback.sleepTimerEndsWithTrack() ? getString(R.string.sleep_timer_end_status)
+                    : getString(R.string.sleep_timer_remaining, formatTime(playback.sleepTimerRemaining() + 999));
+        }
+        if (!status.contentEquals(timerStatus.getText())) {
+            timerStatus.setText(status);
+        }
+        int visibility = sleepTimerActive() ? View.VISIBLE : View.GONE;
+        if (cancelTimer.getVisibility() != visibility) {
+            cancelTimer.setVisibility(visibility);
+            timerChoices.notifyDataSetChanged();
+        }
+    }
+
     private void openPlayer() {
         if (playback == null || playback.currentTrack() == null || playerScreen.isShown()) {
             return;
@@ -967,12 +1256,15 @@ public final class MainActivity extends Activity {
     private void goBack() {
         if (screen == Screen.PLAYER) {
             showScreen(tab);
-        } else if (screen != Screen.PLAYLISTS || !playlistPage.closePlaylist()) {
+        } else if (screen != Screen.PLAYLISTS || !playlistPage.goBack()) {
             showScreen(Screen.LIBRARY);
         }
     }
 
     private void showScreen(Screen target) {
+        if (target != Screen.PLAYLISTS) {
+            playlistPage.finishReordering();
+        }
         screen = target;
         playerScreen.setVisibility(target == Screen.PLAYER ? View.VISIBLE : View.GONE);
         tabShell.setVisibility(target == Screen.PLAYER ? View.GONE : View.VISIBLE);
@@ -980,6 +1272,7 @@ public final class MainActivity extends Activity {
             tab = target;
             library.setVisibility(target == Screen.LIBRARY ? View.VISIBLE : View.GONE);
             playlistPage.setVisibility(target == Screen.PLAYLISTS ? View.VISIBLE : View.GONE);
+            discoverScreen.setVisibility(target == Screen.DISCOVER ? View.VISIBLE : View.GONE);
             settingsScreen.setVisibility(target == Screen.SETTINGS ? View.VISIBLE : View.GONE);
             navigationButtons.forEach((destination, button) -> {
                 boolean selected = destination == target;
@@ -1036,6 +1329,7 @@ public final class MainActivity extends Activity {
 
     private final class PlaylistPage extends LinearLayout {
         private final List<Playlist> playlists = PlaylistStore.load(MainActivity.this);
+        private final Map<String, Track> tracksByUri = new HashMap<>();
         private final TrackAdapter trackAdapter = new TrackAdapter();
         private final BaseAdapter playlistAdapter = new BaseAdapter() {
             @Override public int getCount() { return playlists.size(); }
@@ -1043,18 +1337,10 @@ public final class MainActivity extends Activity {
             @Override public long getItemId(int position) { return position; }
 
             @Override public View getView(int position, View recycled, ViewGroup parent) {
-                TextView name = (TextView) recycled;
-                if (name == null) {
-                    name = singleLineText(16, ink, true);
-                    name.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-                    name.setMinHeight(dp(56));
-                    name.setPadding(dp(12), dp(8), dp(12), dp(8));
-                    name.setCompoundDrawablesRelative(smallIcon(R.drawable.ic_playlists, accent), null, null, null);
-                    name.setCompoundDrawablePadding(dp(12));
-                    name.setBackground(ripple(Color.TRANSPARENT, 14));
-                }
-                name.setText(getItem(position).name());
-                return name;
+                Playlist playlist = getItem(position);
+                PlaylistRow row = recycled == null ? new PlaylistRow() : (PlaylistRow) recycled;
+                row.bind(playlist, resolveTracks(playlist));
+                return row;
             }
         };
 
@@ -1062,13 +1348,15 @@ public final class MainActivity extends Activity {
         private final TextView empty;
         private final ImageButton back;
         private final ImageButton add;
-        private final ListView list;
+        private final ImageButton reorder;
+        private final PlaylistReorderList list;
         private String selectedId;
 
         PlaylistPage() {
             super(MainActivity.this);
             setOrientation(VERTICAL);
             setPadding(dp(20), dp(6), dp(20), dp(10));
+            setFocusableInTouchMode(true);
 
             title = singleLineText(16, ink, true);
             FrameLayout header = screenHeader(title);
@@ -1076,7 +1364,14 @@ public final class MainActivity extends Activity {
                     48, 24, this::closePlaylist);
             add = iconButton(R.drawable.ic_add, R.string.create_playlist, accent, accentSurface,
                     48, 24, this::addOrEditTracks);
+            reorder = iconButton(R.drawable.ic_drag_handle, R.string.reorder_tracks, accent, accentSurface,
+                    48, 24, this::toggleReordering);
+            reorder.setTooltipText(getString(R.string.reorder_tracks));
             addHeaderButton(header, back, Gravity.START);
+            FrameLayout.LayoutParams reorderSize =
+                    new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
+            reorderSize.setMarginEnd(dp(54));
+            header.addView(reorder, reorderSize);
             addHeaderButton(header, add, Gravity.END);
             addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
 
@@ -1084,19 +1379,21 @@ public final class MainActivity extends Activity {
             LinearLayout.LayoutParams resultsSize = new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1);
             resultsSize.topMargin = dp(10);
             addView(results, resultsSize);
-            list = styledList();
+            list = new PlaylistReorderList(MainActivity.this, this::moveTrack);
+            styleList(list);
             list.setOnItemClickListener((parent, row, position, id) -> {
                 if (selectedId == null) {
                     restoreSelection(playlists.get(position).id());
                 } else {
-                    selectTrack(trackAdapter.visible, trackAdapter.getItem(position));
+                    selectTrack(trackAdapter.visible, trackAdapter.getItem(position), selectedId);
                 }
             });
             list.setOnItemLongClickListener((parent, row, position, id) -> {
-                if (selectedId != null) {
-                    return false;
+                if (selectedId == null) {
+                    managePlaylist(playlists.get(position));
+                } else {
+                    openTrackMenu(trackAdapter.getItem(position), selectedPlaylist());
                 }
-                managePlaylist(playlists.get(position));
                 return true;
             });
             results.addView(list, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
@@ -1109,6 +1406,7 @@ public final class MainActivity extends Activity {
         }
 
         void restoreSelection(String id) {
+            finishReordering();
             selectedId = id;
             if (selectedPlaylist() == null) {
                 selectedId = null;
@@ -1124,9 +1422,17 @@ public final class MainActivity extends Activity {
             return true;
         }
 
+        boolean goBack() {
+            return finishReordering() || closePlaylist();
+        }
+
         private Playlist selectedPlaylist() {
+            return findPlaylist(selectedId);
+        }
+
+        private Playlist findPlaylist(String id) {
             for (Playlist playlist : playlists) {
-                if (playlist.id().equals(selectedId)) {
+                if (playlist.id().equals(id)) {
                     return playlist;
                 }
             }
@@ -1142,10 +1448,25 @@ public final class MainActivity extends Activity {
             BaseAdapter activeAdapter = playlistAdapter;
             int emptyMessage = R.string.no_playlists;
             if (playlist != null) {
-                trackAdapter.visible = resolveTracks(playlist);
+                List<Track> available = resolveTracks(playlist);
+                if (!available.equals(trackAdapter.visible)) {
+                    list.resetDrag();
+                }
+                trackAdapter.visible = available;
                 activeAdapter = trackAdapter;
                 emptyMessage = playlist.tracks().isEmpty() ? R.string.empty_playlist
                         : loaded ? R.string.unavailable_playlist : R.string.loading;
+            }
+            boolean canReorder = playlist != null && trackAdapter.getCount() > 1;
+            if (!canReorder) {
+                finishReordering();
+            }
+            reorder.setVisibility(canReorder ? View.VISIBLE : View.GONE);
+            FrameLayout.LayoutParams titleSize = (FrameLayout.LayoutParams) title.getLayoutParams();
+            int titleEnd = dp(canReorder ? 108 : 54);
+            if (titleSize.getMarginEnd() != titleEnd) {
+                titleSize.setMarginEnd(titleEnd);
+                title.setLayoutParams(titleSize);
             }
             if (list.getAdapter() != activeAdapter) {
                 list.setAdapter(activeAdapter);
@@ -1158,14 +1479,18 @@ public final class MainActivity extends Activity {
             empty.setText(emptyMessage);
         }
 
-        private List<Track> resolveTracks(Playlist playlist) {
-            Map<String, Track> available = new HashMap<>();
-            for (Track track : tracks) {
-                available.put(track.libraryUri().toString(), track);
+        private void updateLibrary(List<Track> libraryTracks) {
+            tracksByUri.clear();
+            for (Track track : libraryTracks) {
+                tracksByUri.put(track.libraryUri().toString(), track);
             }
+            render();
+        }
+
+        private List<Track> resolveTracks(Playlist playlist) {
             List<Track> members = new ArrayList<>();
             for (String uri : playlist.tracks()) {
-                Track track = available.get(uri);
+                Track track = tracksByUri.get(uri);
                 if (track != null) {
                     members.add(track);
                 }
@@ -1183,6 +1508,10 @@ public final class MainActivity extends Activity {
         }
 
         private void editName(Playlist playlist) {
+            editName(playlist, null);
+        }
+
+        private void editName(Playlist playlist, Track firstTrack) {
             int title = playlist == null ? R.string.create_playlist : R.string.rename_playlist;
             MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(title));
             EditText name = dialog.addInput(R.string.playlist_name, playlist == null ? "" : playlist.name());
@@ -1193,9 +1522,13 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 if (playlist == null) {
-                    Playlist created = new Playlist(UUID.randomUUID().toString(), value, Collections.emptyList());
+                    List<String> members = firstTrack == null ? Collections.emptyList()
+                            : Collections.singletonList(firstTrack.libraryUri().toString());
+                    Playlist created = new Playlist(UUID.randomUUID().toString(), value, members);
                     playlists.add(created);
-                    selectedId = created.id();
+                    if (firstTrack == null) {
+                        selectedId = created.id();
+                    }
                     savePlaylists();
                 } else {
                     replacePlaylist(playlist, new Playlist(playlist.id(), value, playlist.tracks()));
@@ -1212,6 +1545,90 @@ public final class MainActivity extends Activity {
             dialog.addCancel();
             dialog.addAction(R.string.save, true, save);
             dialog.show();
+        }
+
+        void addTrack(Track track) {
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(R.string.add_to_playlist));
+            String key = track.libraryUri().toString();
+            List<Playlist> choices = new ArrayList<>(playlists);
+            if (!choices.isEmpty()) {
+                CharSequence[] names = new CharSequence[choices.size()];
+                for (int index = 0; index < names.length; index++) {
+                    Playlist playlist = choices.get(index);
+                    names[index] = playlist.tracks().contains(key)
+                            ? getString(R.string.playlist_track_added, playlist.name()) : playlist.name();
+                }
+                dialog.addOptions(names, index -> {
+                    Playlist playlist = choices.get(index);
+                    if (!playlist.tracks().contains(key)) {
+                        List<String> members = new ArrayList<>(playlist.tracks());
+                        members.add(key);
+                        replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), members));
+                    }
+                    dialog.dismiss();
+                });
+            }
+            dialog.addMenuItem(R.string.create_playlist, () -> {
+                dialog.dismiss();
+                editName(null, track);
+            });
+            dialog.addCancel();
+            dialog.show();
+        }
+
+        private void toggleReordering() {
+            hideKeyboard();
+            requestFocus();
+            setReordering(!trackAdapter.reordering);
+        }
+
+        private boolean finishReordering() {
+            if (!trackAdapter.reordering) {
+                return false;
+            }
+            setReordering(false);
+            return true;
+        }
+
+        private void setReordering(boolean active) {
+            trackAdapter.reordering = active;
+            list.resetDrag();
+            reorder.setImageResource(active ? R.drawable.ic_done : R.drawable.ic_drag_handle);
+            reorder.setColorFilter(active ? onAccent : accent);
+            reorder.setBackground(ripple(active ? accent : accentSurface, 24));
+            String label = getString(active ? R.string.done_reordering : R.string.reorder_tracks);
+            reorder.setContentDescription(label);
+            reorder.setTooltipText(label);
+            trackAdapter.notifyDataSetChanged();
+        }
+
+        private boolean moveTrack(String trackId, int target) {
+            Playlist playlist = selectedPlaylist();
+            int from = trackIndex(trackAdapter.visible, trackId);
+            if (!trackAdapter.reordering || playlist == null || from < 0 || from == target
+                    || target < 0 || target >= trackAdapter.getCount()) {
+                return false;
+            }
+            List<String> order = new ArrayList<>();
+            for (Track track : trackAdapter.visible) {
+                order.add(track.libraryUri().toString());
+            }
+            Set<String> available = new LinkedHashSet<>(order);
+            order.add(target, order.remove(from));
+            Iterator<String> moved = order.iterator();
+            List<String> members = new ArrayList<>(playlist.tracks());
+            members.replaceAll(id -> available.contains(id) ? moved.next() : id);
+
+            int first = list.getFirstVisiblePosition();
+            View firstRow = list.getChildAt(0);
+            int offset = firstRow == null ? 0 : firstRow.getTop();
+            replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), members));
+            list.setSelectionFromTop(first, offset);
+            return true;
+        }
+
+        private boolean moveTrackBy(String trackId, int delta) {
+            return moveTrack(trackId, trackIndex(trackAdapter.visible, trackId) + delta);
         }
 
         private void editTracks(Playlist playlist) {
@@ -1248,8 +1665,47 @@ public final class MainActivity extends Activity {
             dialog.show();
         }
 
+        private void confirmRemoveTrack(Playlist playlist, Track track) {
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(R.string.remove_from_playlist));
+            dialog.addMessage(getString(R.string.remove_from_playlist_message,
+                    track.displayTitle(MainActivity.this), playlist.name()));
+            dialog.addCancel();
+            dialog.addAction(R.string.remove, true, () -> {
+                List<String> members = new ArrayList<>(playlist.tracks());
+                members.removeIf(track.libraryUri().toString()::equals);
+                replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), members));
+                dialog.dismiss();
+            });
+            dialog.show();
+        }
+
+        private void removeTrackFromAll(String trackId) {
+            boolean changed = false;
+            for (int index = 0; index < playlists.size(); index++) {
+                Playlist playlist = playlists.get(index);
+                List<String> members = new ArrayList<>(playlist.tracks());
+                if (members.removeIf(trackId::equals)) {
+                    playlists.set(index, new Playlist(playlist.id(), playlist.name(), members));
+                    changed = true;
+                }
+            }
+            if (changed) {
+                PlaylistStore.save(MainActivity.this, playlists);
+            }
+        }
+
         private void managePlaylist(Playlist playlist) {
             MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, playlist.name());
+            String coverKey = CustomArtwork.playlistKey(playlist.id());
+            dialog.addMenuItem(R.string.set_album_cover, () -> {
+                dialog.dismiss();
+                openCoverPicker(coverKey);
+            });
+            Button removeCover = dialog.addMenuItem(R.string.remove_playlist_cover, () -> {
+                dialog.dismiss();
+                updateCover(coverKey, null);
+            });
+            MainActivity.setEnabled(removeCover, CustomArtwork.hasCover(MainActivity.this, coverKey));
             dialog.addMenuItem(R.string.rename_playlist, () -> {
                 dialog.dismiss();
                 editName(playlist);
@@ -1269,6 +1725,8 @@ public final class MainActivity extends Activity {
             dialog.addAction(R.string.delete_playlist, true, () -> {
                 playlists.remove(playlist);
                 savePlaylists();
+                updateCover(CustomArtwork.playlistKey(playlist.id()), null);
+                withPlayback(service -> service.detachPlaylist(playlist.id()));
                 dialog.dismiss();
             });
             dialog.show();
@@ -1277,6 +1735,7 @@ public final class MainActivity extends Activity {
         private void replacePlaylist(Playlist original, Playlist replacement) {
             playlists.set(playlists.indexOf(original), replacement);
             savePlaylists();
+            withPlayback(service -> service.updatePlaylist(replacement.id(), resolveTracks(replacement)));
         }
 
         private void savePlaylists() {
@@ -1285,8 +1744,69 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private final class PlaylistRow extends LinearLayout {
+        private final ImageView icon;
+        private final TextView name;
+        private String coverKey;
+        private List<Track> coverTracks = Collections.emptyList();
+        private Future<?> artworkRequest;
+        private int artworkVersion;
+        private long artworkRevision;
+
+        PlaylistRow() {
+            super(MainActivity.this);
+            setGravity(Gravity.CENTER_VERTICAL);
+            setPadding(dp(8), dp(8), dp(10), dp(8));
+            setMinimumHeight(dp(65));
+            setBackground(ripple(Color.TRANSPARENT, 14));
+
+            icon = artworkTile(accentSurface, 12);
+            int thumbnailSize = dp(THUMBNAIL_DP);
+            addView(icon, new LinearLayout.LayoutParams(thumbnailSize, thumbnailSize));
+            displayArtwork(icon, null, R.drawable.ic_playlists, accent, 11);
+
+            name = singleLineText(16, ink, true);
+            LinearLayout.LayoutParams nameSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
+            nameSize.setMarginStart(dp(12));
+            addView(name, nameSize);
+        }
+
+        void bind(Playlist playlist, List<Track> members) {
+            name.setText(playlist.name());
+            String key = CustomArtwork.playlistKey(playlist.id());
+            long revision = CustomArtwork.revision();
+            if (key.equals(coverKey) && members.equals(coverTracks) && artworkRevision == revision) {
+                return;
+            }
+            coverKey = key;
+            coverTracks = members;
+            artworkRevision = revision;
+            if (artworkRequest != null) {
+                artworkRequest.cancel(false);
+            }
+            int version = ++artworkVersion;
+            displayArtwork(icon, null, R.drawable.ic_playlists, accent, 11);
+            artworkRequest = ArtworkLoader.loadOverride(MainActivity.this, key, ArtworkLoader.THUMBNAIL_SIZE,
+                    bitmap -> displayCoverOrTryTrack(bitmap, version, 0));
+        }
+
+        private void displayCoverOrTryTrack(Bitmap bitmap, int version, int nextTrack) {
+            if (version != artworkVersion || isDestroyed()) {
+                return;
+            }
+            artworkRequest = null;
+            if (bitmap != null) {
+                displayArtwork(icon, bitmap, R.drawable.ic_playlists, accent, 11);
+            } else if (nextTrack < coverTracks.size()) {
+                artworkRequest = ArtworkLoader.load(MainActivity.this, coverTracks.get(nextTrack),
+                        ArtworkLoader.THUMBNAIL_SIZE, cover -> displayCoverOrTryTrack(cover, version, nextTrack + 1));
+            }
+        }
+    }
+
     private final class TrackAdapter extends BaseAdapter {
         private List<Track> visible = Collections.emptyList();
+        private boolean reordering;
 
         @Override public int getCount() { return visible.size(); }
         @Override public Track getItem(int position) { return visible.get(position); }
@@ -1294,7 +1814,9 @@ public final class MainActivity extends Activity {
 
         @Override public View getView(int position, View recycled, ViewGroup parent) {
             TrackRow row = recycled == null ? new TrackRow() : (TrackRow) recycled;
-            row.bind(getItem(position));
+            Track track = getItem(position);
+            row.bind(track);
+            row.bindReorderHandle(track, reordering, position, getCount());
             return row;
         }
     }
@@ -1304,10 +1826,12 @@ public final class MainActivity extends Activity {
         private final TextView title;
         private final TextView artist;
         private final TextView duration;
+        private ImageButton handle;
         private Track artworkTrack;
         private Bitmap artwork;
         private Future<?> artworkRequest;
         private int artworkVersion;
+        private long artworkRevision;
 
         TrackRow() {
             super(MainActivity.this);
@@ -1315,7 +1839,8 @@ public final class MainActivity extends Activity {
             setPadding(dp(8), dp(8), dp(10), dp(8));
             setMinimumHeight(dp(65));
             icon = artworkTile(accentSurface, 12);
-            addView(icon, new LinearLayout.LayoutParams(dp(44), dp(44)));
+            int thumbnailSize = dp(THUMBNAIL_DP);
+            addView(icon, new LinearLayout.LayoutParams(thumbnailSize, thumbnailSize));
             LinearLayout labels = column();
             LinearLayout.LayoutParams labelSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
             labelSize.setMarginStart(dp(12));
@@ -1333,8 +1858,10 @@ public final class MainActivity extends Activity {
             boolean selected = track.uri().equals(selectedTrack);
             setBackground(ripple(selected ? accentSurface : Color.TRANSPARENT, 14));
             setSelected(selected);
-            if (!track.equals(artworkTrack)) {
+            long revision = CustomArtwork.revision();
+            if (!track.equals(artworkTrack) || artworkRevision != revision) {
                 artworkTrack = track;
+                artworkRevision = revision;
                 artwork = null;
                 if (artworkRequest != null) {
                     artworkRequest.cancel(false);
@@ -1351,6 +1878,54 @@ public final class MainActivity extends Activity {
             title.setText(track.displayTitle(MainActivity.this));
             artist.setText(track.artist().isEmpty() ? getString(R.string.audio_file) : track.artist());
             duration.setText(track.duration() > 0 ? formatTime(track.duration()) : "");
+        }
+
+        private void bindReorderHandle(Track track, boolean active, int position, int count) {
+            if (!active) {
+                if (handle != null) {
+                    handle.setVisibility(View.GONE);
+                }
+                return;
+            }
+            if (handle == null) {
+                handle = new ImageButton(MainActivity.this);
+                handle.setImageResource(R.drawable.ic_drag_handle);
+                handle.setColorFilter(accent);
+                handle.setBackground(ripple(Color.TRANSPARENT, 24));
+                handle.setPadding(dp(12), dp(12), dp(12), dp(12));
+                handle.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                handle.setFocusable(false);
+                handle.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+                addView(handle, new LinearLayout.LayoutParams(dp(48), dp(48)));
+            }
+            String trackId = track.libraryUri().toString();
+            handle.setVisibility(View.VISIBLE);
+            handle.setContentDescription(getString(R.string.reorder_track, track.displayTitle(MainActivity.this)));
+            handle.setOnLongClickListener(view -> playlistPage.list.beginDrag(this, view, trackId));
+            handle.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+                @Override public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
+                    super.onInitializeAccessibilityNodeInfo(host, info);
+                    info.removeAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_LONG_CLICK);
+                    if (position > 0) {
+                        info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
+                                R.id.move_track_up, getString(R.string.move_track_up)));
+                    }
+                    if (position + 1 < count) {
+                        info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
+                                R.id.move_track_down, getString(R.string.move_track_down)));
+                    }
+                }
+
+                @Override public boolean performAccessibilityAction(View host, int action, Bundle args) {
+                    if (action == R.id.move_track_up) {
+                        return playlistPage.moveTrackBy(trackId, -1);
+                    }
+                    if (action == R.id.move_track_down) {
+                        return playlistPage.moveTrackBy(trackId, 1);
+                    }
+                    return super.performAccessibilityAction(host, action, args);
+                }
+            });
         }
 
         private void renderArtwork(boolean selected) {

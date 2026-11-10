@@ -25,7 +25,7 @@ final class ArtworkLoader {
     static final int THUMBNAIL_SIZE = 160;
     static final int COVER_SIZE = 896;
 
-    private record Key(Uri uri, Uri libraryUri, long albumId, long modified, int size) {}
+    private record Key(Uri uri, Uri libraryUri, long albumId, long modified, long coverRevision, int size) {}
     private record Result(Bitmap bitmap) {}
 
     private static final ExecutorService WORKERS = Executors.newFixedThreadPool(2);
@@ -40,7 +40,7 @@ final class ArtworkLoader {
     private ArtworkLoader() {}
 
     static Future<?> load(Context context, Track track, int size, Consumer<Bitmap> onLoaded) {
-        Key key = new Key(track.uri(), track.libraryUri(), track.albumId(), track.modified(), size);
+        Key key = new Key(track.uri(), track.libraryUri(), track.albumId(), track.modified(), CustomArtwork.revision(), size);
         Result cached = CACHE.get(key);
         if (cached != null) {
             MAIN.post(() -> onLoaded.accept(cached.bitmap()));
@@ -59,8 +59,20 @@ final class ArtworkLoader {
         });
     }
 
+    static Future<?> loadOverride(Context context, String key, int size, Consumer<Bitmap> onLoaded) {
+        Context app = context.getApplicationContext();
+        return WORKERS.submit(() -> {
+            Bitmap bitmap = CustomArtwork.loadOverride(app, key, size);
+            MAIN.post(() -> onLoaded.accept(bitmap));
+        });
+    }
+
     private static Bitmap read(Context context, Track track, int size) {
-        Bitmap bitmap = readEmbedded(context, track.uri(), size);
+        Bitmap bitmap = CustomArtwork.load(context, track, size);
+        if (bitmap != null) {
+            return bitmap;
+        }
+        bitmap = readEmbedded(context, track.uri(), size);
         if (bitmap != null) {
             return bitmap;
         }

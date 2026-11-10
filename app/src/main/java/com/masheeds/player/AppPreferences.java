@@ -10,6 +10,7 @@ final class AppPreferences {
     static final Locale ARABIC = Locale.forLanguageTag("ar");
     private static final String DARK_THEME = "dark_theme";
     private static final String LANGUAGE = "language";
+    private static final String NAVIGATION_HAPTICS = "navigation_haptics";
 
     private AppPreferences() {}
 
@@ -28,6 +29,14 @@ final class AppPreferences {
 
     static void setLocale(Context context, Locale locale) {
         preferences(context).edit().putString(LANGUAGE, locale.getLanguage()).apply();
+    }
+
+    static boolean navigationHapticsEnabled(Context context) {
+        return preferences(context).getBoolean(NAVIGATION_HAPTICS, true);
+    }
+
+    static void setNavigationHapticsEnabled(Context context, boolean enabled) {
+        preferences(context).edit().putBoolean(NAVIGATION_HAPTICS, enabled).apply();
     }
 
     static Context configuredContext(Context context) {

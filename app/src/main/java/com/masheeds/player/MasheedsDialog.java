@@ -28,6 +28,9 @@ import android.widget.ListView;
 import android.widget.RadioButton;
 import android.widget.TextView;
 
+import java.util.function.IntConsumer;
+import java.util.function.IntPredicate;
+
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
 import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 
@@ -137,9 +140,68 @@ final class MasheedsDialog extends Dialog {
                 return item;
             }
         });
+        addList(list, labels.length);
+    }
+
+    void addOptions(CharSequence[] labels, IntConsumer onSelection) {
+        ListView list = new ListView(getContext());
+        list.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        list.setDividerHeight(dp(6));
+        list.setAdapter(new BaseAdapter() {
+            @Override public int getCount() { return labels.length; }
+            @Override public CharSequence getItem(int position) { return labels[position]; }
+            @Override public long getItemId(int position) { return position; }
+
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                TextView item = (TextView) recycled;
+                if (item == null) {
+                    item = new TextView(getContext());
+                    item.setTextSize(16);
+                    item.setTextColor(ink);
+                    item.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+                    item.setMinHeight(dp(52));
+                    item.setPaddingRelative(dp(14), dp(8), dp(14), dp(8));
+                    item.setBackground(rounded(background, 14));
+                }
+                item.setText(getItem(position));
+                return item;
+            }
+        });
+        list.setOnItemClickListener((parent, view, position, id) -> onSelection.accept(position));
+        addList(list, labels.length);
+    }
+
+    BaseAdapter addRadioOptions(CharSequence[] labels, IntPredicate selected, IntConsumer onSelection) {
+        ListView list = new ListView(getContext());
+        list.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        list.setDividerHeight(dp(6));
+        list.setItemsCanFocus(true);
+        BaseAdapter adapter = new BaseAdapter() {
+            @Override public int getCount() { return labels.length; }
+            @Override public CharSequence getItem(int position) { return labels[position]; }
+            @Override public long getItemId(int position) { return position; }
+
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                RadioButton item = (RadioButton) recycled;
+                if (item == null) {
+                    item = new RadioButton(getContext());
+                    styleChoice(item);
+                }
+                item.setText(getItem(position));
+                item.setChecked(selected.test(position));
+                item.setOnClickListener(view -> onSelection.accept(position));
+                return item;
+            }
+        };
+        list.setAdapter(adapter);
+        addList(list, labels.length);
+        return adapter;
+    }
+
+    void addList(ListView list, int rowCount) {
         int screenHeight = getContext().getResources().getConfiguration().screenHeightDp;
         int maxHeight = Math.min(288, screenHeight / 2);
-        int listHeight = Math.min(labels.length, 5) * 58 - 6;
+        int listHeight = Math.min(rowCount, 5) * 58 - 6;
         addToBody(list, dp(Math.min(listHeight, maxHeight)));
     }
 
@@ -163,31 +225,34 @@ final class MasheedsDialog extends Dialog {
         return input;
     }
 
-    void addMessage(CharSequence message) {
+    TextView addMessage(CharSequence message) {
         TextView text = new TextView(getContext());
         text.setText(message);
         text.setTextSize(15);
         text.setTextColor(muted);
         addToBody(text, WRAP_CONTENT);
+        return text;
     }
 
-    void addMenuItem(int label, Runnable action) {
+    Button addMenuItem(int label, Runnable action) {
         Button item = actionButton(label, ink, background, action);
         item.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         addToBody(item, WRAP_CONTENT);
+        return item;
     }
 
     void addCancel() {
         addAction(android.R.string.cancel, false, this::dismiss);
     }
 
-    void addAction(int label, boolean primary, Runnable action) {
+    Button addAction(int label, boolean primary, Runnable action) {
         Button button = actionButton(label, primary ? onAccent : accent, primary ? accent : Color.TRANSPARENT, action);
         LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
         if (actions.getChildCount() > 0) {
             size.setMarginStart(dp(8));
         }
         actions.addView(button, size);
+        return button;
     }
 
     private Button actionButton(int label, int textColor, int fill, Runnable action) {
