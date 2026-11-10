@@ -17,7 +17,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 final class TrackLibrary {
-    record Track(Uri uri, String title, String artist, long duration) {}
+    record Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified) {
+        String displayTitle(Context context) {
+            return title.isEmpty() ? context.getString(R.string.untitled_track) : title;
+        }
+    }
 
     static List<Track> load(Context context, boolean scanDevice) {
         ContentResolver resolver = context.getContentResolver();
@@ -30,17 +34,22 @@ final class TrackLibrary {
                 return tracks;
             }
             Uri uri = permission.getUri();
-            if (permission.isReadPermission() && !isIndexed(context, uri, tracks)) {
-                Track track = readDocument(context, uri);
-                if (track != null) {
-                    tracks.add(track);
-                }
+            if (!permission.isReadPermission()) {
+                continue;
+            }
+            Uri libraryUri = libraryUri(context, uri);
+            if (tracks.stream().anyMatch(track -> libraryUri.equals(track.libraryUri()))) {
+                continue;
+            }
+            Track track = readDocument(context, uri, libraryUri);
+            if (track != null) {
+                tracks.add(track);
             }
         }
 
-        Collator collator = Collator.getInstance();
+        Collator collator = Collator.getInstance(context.getResources().getConfiguration().getLocales().get(0));
         tracks.sort((left, right) -> {
-            int titleOrder = collator.compare(left.title(), right.title());
+            int titleOrder = collator.compare(left.displayTitle(context), right.displayTitle(context));
             return titleOrder != 0 ? titleOrder : collator.compare(left.artist(), right.artist());
         });
         return tracks;
@@ -53,37 +62,41 @@ final class TrackLibrary {
                 MediaStore.Audio.Media.TITLE,
                 MediaStore.Audio.Media.DISPLAY_NAME,
                 MediaStore.Audio.Media.ARTIST,
-                MediaStore.Audio.Media.DURATION
+                MediaStore.Audio.Media.DURATION,
+                MediaStore.Audio.Media.ALBUM_ID,
+                MediaStore.Audio.Media.ALBUM,
+                MediaStore.Audio.Media.DATE_MODIFIED
         };
         try (Cursor cursor = resolver.query(collection, columns,
                 MediaStore.Audio.Media.IS_MUSIC + " != 0", null, null)) {
             while (cursor != null && !Thread.currentThread().isInterrupted() && cursor.moveToNext()) {
                 Uri uri = ContentUris.withAppendedId(collection, cursor.getLong(0));
-                tracks.add(new Track(uri, title(cursor.getString(1), cursor.getString(2)),
-                        artist(cursor.getString(3)), cursor.getLong(4)));
+                tracks.add(new Track(uri, uri, title(cursor.getString(1), cursor.getString(2)),
+                        artist(cursor.getString(3)), cursor.getLong(4),
+                        hasMetadata(cursor.getString(6)) ? cursor.getLong(5) : 0, cursor.getLong(7)));
             }
         } catch (SecurityException ignored) {
             // Permission can be revoked while a scan is in progress.
         }
     }
 
-    private static boolean isIndexed(Context context, Uri uri, List<Track> tracks) {
-        if (Build.VERSION.SDK_INT < 29 || tracks.isEmpty()) {
-            return false;
+    private static Uri libraryUri(Context context, Uri uri) {
+        if (Build.VERSION.SDK_INT < 29) {
+            return uri;
         }
         try {
             Uri mediaUri = MediaStore.getMediaUri(context, uri);
             if (mediaUri != null && mediaUri.getPathSegments().contains("audio")) {
-                String id = mediaUri.getLastPathSegment();
-                return tracks.stream().anyMatch(track -> id.equals(track.uri().getLastPathSegment()));
+                return ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                        ContentUris.parseId(mediaUri));
             }
         } catch (IllegalArgumentException | SecurityException ignored) {
             // Some document providers do not have a corresponding MediaStore URI.
         }
-        return false;
+        return uri;
     }
 
-    private static Track readDocument(Context context, Uri uri) {
+    private static Track readDocument(Context context, Uri uri, Uri libraryUri) {
         String fileName;
         try (Cursor cursor = context.getContentResolver().query(uri,
                 new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
@@ -100,10 +113,10 @@ final class TrackLibrary {
             String name = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE);
             String artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST);
             String duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
-            return new Track(uri, title(name, fileName), artist(artist),
-                    duration == null ? 0 : Long.parseLong(duration));
+            return new Track(uri, libraryUri, title(name, fileName), artist(artist),
+                    duration == null ? 0 : Long.parseLong(duration), 0, 0);
         } catch (RuntimeException ignored) {
-            return new Track(uri, title(null, fileName), "", 0);
+            return new Track(uri, libraryUri, title(null, fileName), "", 0, 0, 0);
         } finally {
             try {
                 retriever.release();
@@ -121,7 +134,7 @@ final class TrackLibrary {
             int extension = fileName.lastIndexOf('.');
             return extension > 0 ? fileName.substring(0, extension) : fileName;
         }
-        return "Untitled track";
+        return "";
     }
 
     private static String artist(String artist) {

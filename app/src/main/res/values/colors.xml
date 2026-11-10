@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="app_background">#F8F9F5</color>
+    <color name="text_primary">#192C23</color>
+    <color name="text_secondary">#52635A</color>
+    <color name="accent">#245843</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="accent_surface">#E6EFE3</color>
+    <color name="surface">#EEF1EA</color>
+    <color name="seek_track">#D6E1D7</color>
+    <color name="ripple">#24488866</color>
+    <color name="record_disc">#245843</color>
+    <color name="record_groove">#4A755C</color>
+    <color name="record_label">#D8E7D6</color>
+    <color name="record_wave">#245843</color>
+    <color name="library_art">#CFDECF</color>
+</resources>

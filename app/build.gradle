@@ -11,8 +11,19 @@ android {
         applicationId 'com.masheeds.player'
         minSdk 26
         targetSdk 36
-        versionCode 1
-        versionName '1.0'
+        versionCode 3
+        versionName '1.2'
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    bundle {
+        language {
+            // Both languages must be available when the app switches languages offline.
+            enableSplit = false
+        }
     }
 
     compileOptions {

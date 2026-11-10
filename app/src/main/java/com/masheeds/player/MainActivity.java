@@ -12,6 +12,7 @@ import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.database.ContentObserver;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -53,30 +54,34 @@ import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 
 import com.masheeds.player.TrackLibrary.Track;
+import com.masheeds.player.PlaylistStore.Playlist;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.IntConsumer;
 
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
 import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 
 public final class MainActivity extends Activity {
-    private static final int BACKGROUND = 0xFFF8F9F5;
-    private static final int INK = 0xFF192C23;
-    private static final int MUTED = 0xFF52635A;
-    private static final int GREEN = 0xFF245843;
-    private static final int SOFT_GREEN = 0xFFE6EFE3;
-    private static final int SURFACE = 0xFFEEF1EA;
     private static final int PLAYER = 0xFF173D30;
     private static final int PLAYER_MUTED = 0xFFC5D9CB;
     private static final int PICK_FILES = 1;
     private static final int AUDIO_ACCESS = 2;
+
+    private enum Screen { LIBRARY, PLAYLISTS, SETTINGS, PLAYER }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService scanner = Executors.newSingleThreadExecutor();
@@ -96,6 +101,8 @@ public final class MainActivity extends Activity {
     private final ServiceConnection connection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
             playback = ((PlaybackService.LocalBinder) binder).service();
+            playback.refreshLanguage();
+            playback.setRepeatMode(repeatMode);
             playback.setListener(MainActivity.this::renderPlayback);
             renderPlayback();
         }
@@ -107,9 +114,20 @@ public final class MainActivity extends Activity {
     };
 
     private PlaybackService playback;
+    private Screen screen = Screen.LIBRARY;
+    private Screen tab = Screen.LIBRARY;
+    private RepeatMode repeatMode;
+    private Locale appLocale;
+    private boolean darkMode;
+    private int ink;
+    private int muted;
+    private int accent;
+    private int onAccent;
+    private int accentSurface;
+    private int surface;
+    private int rippleColor;
     private boolean bound;
     private boolean observing;
-    private boolean playerOpen;
     private boolean scrubbing;
     private boolean loaded;
     private boolean keyboardOpen;
@@ -120,7 +138,11 @@ public final class MainActivity extends Activity {
     private Uri selectedTrack;
     private Uri scrubTrack;
 
+    private LinearLayout tabShell;
+    private LinearLayout bottomNavigation;
+    private final Map<Screen, Button> navigationButtons = new EnumMap<>(Screen.class);
     private LinearLayout library;
+    private PlaylistPage playlistPage;
     private LinearLayout libraryHeading;
     private LinearLayout trackHeading;
     private EditText search;
@@ -136,12 +158,14 @@ public final class MainActivity extends Activity {
     private Button emptyAction;
     private LinearLayout miniPlayer;
     private LinearLayout miniDetails;
+    private ImageView miniArtwork;
     private TextView miniTitle;
     private TextView miniArtist;
     private ImageButton miniToggle;
     private ImageButton miniNext;
     private ProgressBar miniProgress;
     private ScrollView playerScreen;
+    private ImageView playerArtwork;
     private TextView playerTitle;
     private TextView playerArtist;
     private TextView elapsed;
@@ -150,19 +174,38 @@ public final class MainActivity extends Activity {
     private ImageButton playerToggle;
     private ImageButton playerNext;
     private ImageButton playerPrevious;
+    private ImageButton playerRepeat;
+    private ScrollView settingsScreen;
+    private TextView audioAccessSummary;
+
+    @Override protected void attachBaseContext(Context base) {
+        super.attachBaseContext(AppPreferences.configuredContext(base));
+    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        repeatMode = RepeatMode.load(this);
+        appLocale = AppPreferences.locale(this);
+        darkMode = AppPreferences.isDark(this);
+        ink = getColor(R.color.text_primary);
+        muted = getColor(R.color.text_secondary);
+        accent = getColor(R.color.accent);
+        onAccent = getColor(R.color.on_accent);
+        accentSurface = getColor(R.color.accent_surface);
+        surface = getColor(R.color.surface);
+        rippleColor = getColor(R.color.ripple);
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(BACKGROUND);
+        root.setBackgroundColor(getColor(R.color.app_background));
+        root.setLayoutDirection(getResources().getConfiguration().getLayoutDirection());
         root.setOnApplyWindowInsetsListener(this::applyInsets);
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
         } else {
+            int lightBars = darkMode ? 0 : View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
             getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+                    | lightBars);
         }
 
         FrameLayout content = new FrameLayout(this);
@@ -170,15 +213,29 @@ public final class MainActivity extends Activity {
         int screenWidth = dp(getResources().getConfiguration().screenWidthDp);
         root.addView(content, new FrameLayout.LayoutParams(
                 screenWidth > maxWidth ? maxWidth : MATCH_PARENT, MATCH_PARENT, Gravity.CENTER));
-        library = buildLibrary();
-        content.addView(library, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        tabShell = buildTabShell();
+        content.addView(tabShell, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         playerScreen = buildPlayerScreen();
         playerScreen.setVisibility(View.GONE);
         content.addView(playerScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        renderRepeatMode();
+        showScreen(Screen.LIBRARY);
         setContentView(root);
         if (state != null) {
             search.setText(state.getString("query", ""));
-            playerOpen = state.getBoolean("playerOpen");
+            String savedScreen = state.getString("screen");
+            String savedTab = state.getString("tab", savedScreen);
+            playlistPage.restoreSelection(state.getString("playlist"));
+            if (Screen.PLAYLISTS.name().equals(savedTab)) {
+                showScreen(Screen.PLAYLISTS);
+            } else if (Screen.SETTINGS.name().equals(savedTab)) {
+                showScreen(Screen.SETTINGS);
+            }
+            int scroll = state.getInt("settingsScroll");
+            settingsScreen.post(() -> settingsScreen.scrollTo(0, scroll));
+            if (Screen.PLAYER.name().equals(savedScreen)) {
+                screen = Screen.PLAYER;
+            }
         }
     }
 
@@ -192,6 +249,7 @@ public final class MainActivity extends Activity {
             if (keyboardOpen != visible) {
                 keyboardOpen = visible;
                 libraryHeading.setVisibility(visible ? View.GONE : View.VISIBLE);
+                bottomNavigation.setVisibility(visible ? View.GONE : View.VISIBLE);
                 if (playback != null) {
                     miniPlayer.setVisibility(!visible && playback.currentTrack() != null
                             ? View.VISIBLE : View.GONE);
@@ -212,6 +270,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onResume() {
         super.onResume();
+        renderAudioAccess();
         watchDeviceLibrary();
         refreshLibrary();
     }
@@ -250,18 +309,68 @@ public final class MainActivity extends Activity {
 
     @Override public void onSaveInstanceState(Bundle state) {
         state.putString("query", search.getText().toString());
-        state.putBoolean("playerOpen", playerOpen);
+        state.putString("screen", screen.name());
+        state.putString("tab", tab.name());
+        state.putString("playlist", playlistPage.selectedId);
+        state.putInt("settingsScroll", settingsScreen.getScrollY());
         super.onSaveInstanceState(state);
     }
 
     // Android 13 and up use the registered OnBackInvokedCallback.
     @SuppressLint("GestureBackNavigation")
     @Override public void onBackPressed() {
-        if (Build.VERSION.SDK_INT < 33 && playerOpen) {
-            showLibrary();
+        if (Build.VERSION.SDK_INT < 33 && screen != Screen.LIBRARY) {
+            goBack();
         } else {
             super.onBackPressed();
         }
+    }
+
+    private LinearLayout buildTabShell() {
+        LinearLayout shell = column();
+        FrameLayout pages = new FrameLayout(this);
+        shell.addView(pages, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+        library = buildLibrary();
+        playlistPage = new PlaylistPage();
+        settingsScreen = buildSettingsScreen();
+        pages.addView(library, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        pages.addView(playlistPage, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        pages.addView(settingsScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+
+        miniPlayer = buildMiniPlayer();
+        miniPlayer.setVisibility(View.GONE);
+        LinearLayout.LayoutParams miniSize = new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT);
+        miniSize.setMargins(dp(20), dp(6), dp(20), dp(8));
+        shell.addView(miniPlayer, miniSize);
+
+        bottomNavigation = row();
+        bottomNavigation.setPadding(dp(8), dp(4), dp(8), dp(4));
+        bottomNavigation.setBackgroundColor(surface);
+        addNavigationButton(Screen.LIBRARY, R.string.library_settings, R.drawable.ic_tracks);
+        addNavigationButton(Screen.PLAYLISTS, R.string.playlists, R.drawable.ic_playlists);
+        addNavigationButton(Screen.SETTINGS, R.string.settings, R.drawable.ic_settings);
+        shell.addView(bottomNavigation, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+        return shell;
+    }
+
+    private void addNavigationButton(Screen destination, int label, int icon) {
+        Button navigation = button(label, muted, Color.TRANSPARENT);
+        navigation.setCompoundDrawablesRelative(null, smallIcon(icon, muted), null, null);
+        navigation.setCompoundDrawablePadding(dp(4));
+        navigation.setTextSize(12);
+        navigation.setPadding(dp(4), dp(6), dp(4), dp(6));
+        navigation.setMinimumHeight(dp(56));
+        navigation.setOnClickListener(view -> {
+            if (screen == Screen.PLAYLISTS && destination == Screen.PLAYLISTS) {
+                playlistPage.closePlaylist();
+            }
+            hideKeyboard();
+            showScreen(destination);
+        });
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
+        size.setMargins(dp(2), 0, dp(2), 0);
+        bottomNavigation.addView(navigation, size);
+        navigationButtons.put(destination, navigation);
     }
 
     private LinearLayout buildLibrary() {
@@ -272,36 +381,26 @@ public final class MainActivity extends Activity {
         LinearLayout bar = row();
         ImageView logo = image(R.drawable.ic_masheeds);
         bar.addView(logo, new LinearLayout.LayoutParams(dp(38), dp(38)));
-        TextView brand = text(R.string.app_name, 19, INK, true);
+        TextView brand = text(R.string.app_name, 19, ink, true);
         LinearLayout.LayoutParams brandSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
-        brandSize.leftMargin = dp(10);
+        brandSize.setMarginStart(dp(10));
         bar.addView(brand, brandSize);
-        Button add = button(R.string.add_files, GREEN, SOFT_GREEN);
-        add.setCompoundDrawablesRelative(smallIcon(R.drawable.ic_add, GREEN), null, null, null);
-        add.setCompoundDrawablePadding(dp(5));
-        add.setOnClickListener(view -> openPicker());
-        bar.addView(add, new LinearLayout.LayoutParams(WRAP_CONTENT, dp(48)));
+        ImageButton add = iconButton(R.drawable.ic_add, R.string.add_files, accent, accentSurface,
+                48, 24, this::openPicker);
+        bar.addView(add, new LinearLayout.LayoutParams(dp(48), dp(48)));
         page.addView(bar, new LinearLayout.LayoutParams(MATCH_PARENT, dp(58)));
-
-        libraryHeading = column();
-        TextView title = text(R.string.library_title, 34, INK, true);
-        markHeading(title);
-        libraryHeading.addView(title);
-        TextView subtitle = text(R.string.library_description, 15, MUTED, false);
-        addWithMargin(libraryHeading, subtitle, MATCH_PARENT, WRAP_CONTENT, 3);
-        addWithMargin(page, libraryHeading, MATCH_PARENT, WRAP_CONTENT, 18);
 
         search = new EditText(this);
         search.setSingleLine(true);
         search.setHint(R.string.search_tracks);
-        search.setTextColor(INK);
-        search.setHintTextColor(MUTED);
+        search.setTextColor(ink);
+        search.setHintTextColor(muted);
         search.setTextSize(15);
         search.setInputType(InputType.TYPE_CLASS_TEXT);
         search.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         search.setPadding(dp(14), 0, dp(14), 0);
-        search.setBackground(round(SURFACE, 14));
-        search.setCompoundDrawablesRelative(smallIcon(R.drawable.ic_search, MUTED), null, null, null);
+        search.setBackground(round(surface, 14));
+        search.setCompoundDrawablesRelative(smallIcon(R.drawable.ic_search, muted), null, null, null);
         search.setCompoundDrawablePadding(dp(9));
         search.setOnEditorActionListener((field, action, event) -> {
             if (action == EditorInfo.IME_ACTION_SEARCH) {
@@ -319,17 +418,25 @@ public final class MainActivity extends Activity {
             @Override public void afterTextChanged(Editable text) {}
         });
         search.setVisibility(View.GONE);
-        addWithMargin(page, search, MATCH_PARENT, dp(48), 18);
+        addWithMargin(page, search, MATCH_PARENT, dp(48), 8);
+
+        libraryHeading = column();
+        TextView title = text(R.string.library_title, 34, ink, true);
+        markHeading(title);
+        libraryHeading.addView(title);
+        TextView subtitle = text(R.string.library_description, 15, muted, false);
+        addWithMargin(libraryHeading, subtitle, MATCH_PARENT, WRAP_CONTENT, 3);
+        addWithMargin(page, libraryHeading, MATCH_PARENT, WRAP_CONTENT, 18);
 
         trackHeading = row();
-        TextView tracksLabel = text(R.string.tracks, 17, INK, true);
+        TextView tracksLabel = text(R.string.tracks, 17, ink, true);
         markHeading(tracksLabel);
         trackHeading.addView(tracksLabel);
-        count = text(0, 13, MUTED, false);
+        count = text(0, 13, muted, false);
         LinearLayout.LayoutParams countSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
-        countSize.leftMargin = dp(10);
+        countSize.setMarginStart(dp(10));
         trackHeading.addView(count, countSize);
-        scanButton = button(R.string.scan_device, GREEN, Color.TRANSPARENT);
+        scanButton = button(R.string.scan_device, accent, Color.TRANSPARENT);
         scanButton.setOnClickListener(view -> requestAudioAccess());
         trackHeading.addView(scanButton, new LinearLayout.LayoutParams(WRAP_CONTENT, dp(48)));
         trackHeading.setVisibility(View.GONE);
@@ -337,28 +444,30 @@ public final class MainActivity extends Activity {
 
         FrameLayout results = new FrameLayout(this);
         page.addView(results, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
-        trackList = new ListView(this);
-        trackList.setDivider(null);
-        trackList.setClipToPadding(false);
-        trackList.setPadding(0, 0, 0, dp(6));
-        trackList.setSelector(android.R.color.transparent);
+        trackList = styledList();
         adapter = new TrackAdapter();
         trackList.setAdapter(adapter);
-        trackList.setOnItemClickListener((parent, row, position, id) -> selectTrack(adapter.getItem(position)));
+        trackList.setOnItemClickListener((parent, row, position, id) -> selectTrack(tracks, adapter.getItem(position)));
         trackList.setVisibility(View.GONE);
         results.addView(trackList, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         placeholder = buildPlaceholder();
         placeholder.setVisibility(View.GONE);
         results.addView(placeholder, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         loading = new ProgressBar(this);
-        loading.setIndeterminateTintList(ColorStateList.valueOf(GREEN));
+        loading.setIndeterminateTintList(ColorStateList.valueOf(accent));
         loading.setContentDescription(getString(R.string.loading));
         results.addView(loading, new FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER));
 
-        miniPlayer = buildMiniPlayer();
-        miniPlayer.setVisibility(View.GONE);
-        addWithMargin(page, miniPlayer, MATCH_PARENT, WRAP_CONTENT, 8);
         return page;
+    }
+
+    private ListView styledList() {
+        ListView list = new ListView(this);
+        list.setDivider(null);
+        list.setClipToPadding(false);
+        list.setPadding(0, 0, 0, dp(6));
+        list.setSelector(android.R.color.transparent);
+        return list;
     }
 
     private ScrollView buildPlaceholder() {
@@ -370,18 +479,19 @@ public final class MainActivity extends Activity {
         scroll.addView(panel);
 
         emptyIcon = image(R.drawable.ic_library);
-        emptyIcon.setBackground(round(SOFT_GREEN, 28));
+        emptyIcon.setBackground(round(accentSurface, 28));
         emptyIcon.setPadding(dp(18), dp(18), dp(18), dp(18));
         panel.addView(emptyIcon, new LinearLayout.LayoutParams(dp(94), dp(94)));
-        emptyTitle = text(0, 23, INK, true);
+        emptyTitle = text(0, 23, ink, true);
         emptyTitle.setGravity(Gravity.CENTER);
         addWithMargin(panel, emptyTitle, MATCH_PARENT, WRAP_CONTENT, 18);
-        emptyMessage = text(0, 15, MUTED, false);
+        emptyMessage = text(0, 15, muted, false);
         emptyMessage.setGravity(Gravity.CENTER);
         emptyMessage.setMaxWidth(dp(290));
         emptyMessage.setLineSpacing(dp(3), 1);
         addWithMargin(panel, emptyMessage, WRAP_CONTENT, WRAP_CONTENT, 6);
-        emptyAction = button(R.string.scan_device, Color.WHITE, GREEN);
+        emptyAction = button(R.string.scan_device, onAccent, accent);
+        emptyAction.setOnClickListener(view -> requestAudioAccess());
         addWithMargin(panel, emptyAction, WRAP_CONTENT, dp(48), 18);
         return scroll;
     }
@@ -398,11 +508,11 @@ public final class MainActivity extends Activity {
         miniDetails.setBackground(ripple(Color.TRANSPARENT, 10));
         miniDetails.setOnClickListener(view -> openPlayer());
         controls.addView(miniDetails, new LinearLayout.LayoutParams(0, dp(50), 1));
-        ImageView icon = noteTile(0xFF315647, PLAYER_MUTED, 10, 10);
-        miniDetails.addView(icon, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        miniArtwork = artworkTile(0xFF315647, 10);
+        miniDetails.addView(miniArtwork, new LinearLayout.LayoutParams(dp(42), dp(42)));
         LinearLayout labels = column();
         LinearLayout.LayoutParams labelSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
-        labelSize.leftMargin = dp(10);
+        labelSize.setMarginStart(dp(10));
         miniDetails.addView(labels, labelSize);
         miniTitle = singleLineText(15, Color.WHITE, true);
         miniArtist = singleLineText(12, PLAYER_MUTED, false);
@@ -417,6 +527,7 @@ public final class MainActivity extends Activity {
         controls.addView(miniNext, new LinearLayout.LayoutParams(dp(48), dp(48)));
 
         miniProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        miniProgress.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         miniProgress.setProgressTintList(ColorStateList.valueOf(0xFFAACDAF));
         miniProgress.setProgressBackgroundTintList(ColorStateList.valueOf(0xFF3D6051));
         miniProgress.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
@@ -432,39 +543,35 @@ public final class MainActivity extends Activity {
         page.setPadding(dp(20), dp(6), dp(20), dp(20));
         screen.addView(page);
 
-        FrameLayout header = new FrameLayout(this);
+        FrameLayout header = screenHeader(text(R.string.now_playing, 16, ink, true));
+        ImageButton close = iconButton(R.drawable.ic_down, R.string.close_player, accent, accentSurface,
+                48, 24, this::goBack);
+        addHeaderButton(header, close, Gravity.START);
         page.addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
-        ImageButton close = iconButton(R.drawable.ic_down, R.string.back_to_library, GREEN, SOFT_GREEN,
-                48, 24, this::showLibrary);
-        header.addView(close, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.START | Gravity.CENTER_VERTICAL));
-        TextView label = text(R.string.now_playing, 16, INK, true);
-        markHeading(label);
-        header.addView(label, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER));
 
         int width = getResources().getConfiguration().screenWidthDp;
         int height = getResources().getConfiguration().screenHeightDp;
         int coverSize = dp(Math.min(320, Math.min(width - 48, Math.max(144, height - 330))));
-        ImageView cover = image(R.drawable.ic_record);
-        cover.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        cover.setBackground(round(SOFT_GREEN, 28));
-        cover.setPadding(dp(8), dp(8), dp(8), dp(8));
-        addWithMargin(page, cover, coverSize, coverSize, 22);
+        playerArtwork = artworkTile(accentSurface, 28);
+        playerArtwork.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        addWithMargin(page, playerArtwork, coverSize, coverSize, 22);
 
-        playerTitle = text(0, 27, INK, true);
+        playerTitle = text(0, 27, ink, true);
         playerTitle.setGravity(Gravity.CENTER);
         playerTitle.setMaxLines(2);
         playerTitle.setEllipsize(TextUtils.TruncateAt.END);
         addWithMargin(page, playerTitle, MATCH_PARENT, WRAP_CONTENT, 21);
-        playerArtist = singleLineText(15, MUTED, false);
+        playerArtist = singleLineText(15, muted, false);
         playerArtist.setGravity(Gravity.CENTER);
         addWithMargin(page, playerArtist, MATCH_PARENT, WRAP_CONTENT, 4);
 
         seek = new SeekBar(this);
+        seek.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         seek.setPadding(dp(6), 0, dp(6), 0);
         seek.setContentDescription(getString(R.string.seek));
-        seek.setProgressTintList(ColorStateList.valueOf(GREEN));
-        seek.setProgressBackgroundTintList(ColorStateList.valueOf(0xFFD6E1D7));
-        seek.setThumbTintList(ColorStateList.valueOf(GREEN));
+        seek.setProgressTintList(ColorStateList.valueOf(accent));
+        seek.setProgressBackgroundTintList(ColorStateList.valueOf(getColor(R.color.seek_track)));
+        seek.setThumbTintList(ColorStateList.valueOf(accent));
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar bar, int position, boolean fromUser) {
                 if (fromUser) {
@@ -488,27 +595,154 @@ public final class MainActivity extends Activity {
         });
         addWithMargin(page, seek, MATCH_PARENT, dp(46), 10);
         LinearLayout times = row();
-        elapsed = text(0, 13, MUTED, false);
-        totalTime = text(0, 13, MUTED, false);
+        times.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        elapsed = text(0, 13, muted, false);
+        totalTime = text(0, 13, muted, false);
         times.addView(elapsed, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
         times.addView(totalTime);
         page.addView(times, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
 
         LinearLayout buttons = row();
         buttons.setGravity(Gravity.CENTER);
-        playerPrevious = iconButton(R.drawable.ic_previous, R.string.previous_track, GREEN, SOFT_GREEN, 54, 26,
+        buttons.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        playerPrevious = iconButton(R.drawable.ic_previous, R.string.previous_track, accent, accentSurface, 54, 26,
                 () -> withPlayback(PlaybackService::previous));
-        playerToggle = iconButton(R.drawable.ic_play, R.string.play, Color.WHITE, GREEN, 72, 34,
+        playerToggle = iconButton(R.drawable.ic_play, R.string.play, onAccent, accent, 72, 34,
                 () -> withPlayback(PlaybackService::toggle));
-        playerNext = iconButton(R.drawable.ic_next, R.string.next_track, GREEN, SOFT_GREEN, 54, 26,
+        playerNext = iconButton(R.drawable.ic_next, R.string.next_track, accent, accentSurface, 54, 26,
                 () -> withPlayback(PlaybackService::next));
+        playerRepeat = iconButton(R.drawable.ic_repeat, repeatMode.label, muted, surface,
+                48, 24, this::cycleRepeatMode);
         buttons.addView(playerPrevious, new LinearLayout.LayoutParams(dp(54), dp(54)));
         LinearLayout.LayoutParams toggleSize = new LinearLayout.LayoutParams(dp(72), dp(72));
-        toggleSize.setMargins(dp(18), 0, dp(18), 0);
+        toggleSize.setMargins(dp(12), 0, dp(12), 0);
         buttons.addView(playerToggle, toggleSize);
         buttons.addView(playerNext, new LinearLayout.LayoutParams(dp(54), dp(54)));
+        LinearLayout.LayoutParams repeatSize = new LinearLayout.LayoutParams(dp(48), dp(48));
+        repeatSize.setMarginStart(dp(12));
+        buttons.addView(playerRepeat, repeatSize);
         addWithMargin(page, buttons, MATCH_PARENT, WRAP_CONTENT, 22);
         return screen;
+    }
+
+    private ScrollView buildSettingsScreen() {
+        ScrollView settings = new ScrollView(this);
+        settings.setFillViewport(true);
+        LinearLayout page = column();
+        page.setPadding(dp(20), dp(6), dp(20), dp(24));
+        settings.addView(page);
+        page.addView(screenHeader(text(R.string.settings, 16, ink, true)),
+                new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
+
+        TextView preferencesSection = text(R.string.preferences, 18, ink, true);
+        markHeading(preferencesSection);
+        addWithMargin(page, preferencesSection, MATCH_PARENT, WRAP_CONTENT, 24);
+        LinearLayout preferencesCard = column();
+        preferencesCard.setPadding(dp(2), dp(4), dp(2), dp(4));
+        preferencesCard.setBackground(round(surface, 16));
+        addWithMargin(page, preferencesCard, MATCH_PARENT, WRAP_CONTENT, 10);
+
+        int[] themes = {R.string.theme_light, R.string.theme_dark};
+        int theme = darkMode ? 1 : 0;
+        Button themeButton = preferenceButton(R.string.theme, themes[theme],
+                () -> choosePreference(R.string.theme, themes, theme, choice -> {
+                    AppPreferences.setDark(this, choice == 1);
+                    recreate();
+                }));
+        preferencesCard.addView(themeButton, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+
+        int[] languages = {R.string.language_english, R.string.language_arabic};
+        int language = appLocale.equals(AppPreferences.ARABIC) ? 1 : 0;
+        Button languageButton = preferenceButton(R.string.app_language, languages[language],
+                () -> choosePreference(R.string.app_language, languages, language, choice -> {
+                    AppPreferences.setLocale(this, choice == 1 ? AppPreferences.ARABIC : Locale.ENGLISH);
+                    withPlayback(PlaybackService::refreshLanguage);
+                    recreate();
+                }));
+        preferencesCard.addView(languageButton, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+
+        TextView librarySection = text(R.string.library_settings, 18, ink, true);
+        markHeading(librarySection);
+        addWithMargin(page, librarySection, MATCH_PARENT, WRAP_CONTENT, 24);
+        LinearLayout accessCard = column();
+        accessCard.setPadding(dp(14), dp(14), dp(14), dp(14));
+        accessCard.setBackground(round(surface, 16));
+        addWithMargin(page, accessCard, MATCH_PARENT, WRAP_CONTENT, 10);
+        audioAccessSummary = text(0, 15, muted, false);
+        accessCard.addView(audioAccessSummary);
+        Button audioAccess = button(R.string.audio_access, accent, accentSurface);
+        audioAccess.setOnClickListener(view -> {
+            if (hasAudioAccess()) {
+                openAppSettings();
+            } else {
+                requestAudioAccess();
+            }
+        });
+        addWithMargin(accessCard, audioAccess, WRAP_CONTENT, dp(48), 12);
+
+        TextView version = text(0, 14, muted, false);
+        version.setText(getString(R.string.app_version, BuildConfig.VERSION_NAME));
+        addWithMargin(page, version, MATCH_PARENT, WRAP_CONTENT, 24);
+        return settings;
+    }
+
+    private Button preferenceButton(int title, int selection, Runnable action) {
+        Button preference = button(title, ink, Color.TRANSPARENT);
+        preference.setText(getString(R.string.preference_value, getString(title), getString(selection)));
+        preference.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        preference.setMinHeight(dp(48));
+        preference.setOnClickListener(view -> action.run());
+        return preference;
+    }
+
+    private void choosePreference(int title, int[] options, int selected, IntConsumer onSelection) {
+        MasheedsDialog dialog = new MasheedsDialog(this, getText(title));
+        for (int index = 0; index < options.length; index++) {
+            int choice = index;
+            dialog.addChoice(getText(options[index]), index == selected, () -> {
+                dialog.dismiss();
+                if (choice != selected) {
+                    onSelection.accept(choice);
+                }
+            });
+        }
+        dialog.addCancel();
+        dialog.show();
+    }
+
+    private FrameLayout screenHeader(TextView label) {
+        FrameLayout header = new FrameLayout(this);
+        markHeading(label);
+        label.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams size = new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER);
+        size.setMargins(dp(54), 0, dp(54), 0);
+        header.addView(label, size);
+        return header;
+    }
+
+    private void addHeaderButton(FrameLayout header, ImageButton button, int edge) {
+        header.addView(button, new FrameLayout.LayoutParams(dp(48), dp(48), edge | Gravity.CENTER_VERTICAL));
+    }
+
+    private void cycleRepeatMode() {
+        repeatMode = repeatMode.next();
+        repeatMode.save(this);
+        renderRepeatMode();
+        if (playback != null) {
+            playback.setRepeatMode(repeatMode);
+        }
+    }
+
+    private void renderRepeatMode() {
+        boolean enabled = repeatMode != RepeatMode.OFF;
+        playerRepeat.setImageResource(repeatMode == RepeatMode.ONE ? R.drawable.ic_repeat_one : R.drawable.ic_repeat);
+        playerRepeat.setColorFilter(enabled ? onAccent : muted);
+        playerRepeat.setBackground(ripple(enabled ? accent : surface, 24));
+        playerRepeat.setContentDescription(getString(R.string.change_repeat_mode, getString(repeatMode.label)));
+    }
+
+    private void renderAudioAccess() {
+        audioAccessSummary.setText(hasAudioAccess() ? R.string.audio_access_allowed : R.string.audio_access_needed);
     }
 
     private void openPicker() {
@@ -574,17 +808,22 @@ public final class MainActivity extends Activity {
 
     private void requestAudioAccess() {
         if (requiresPermissionSettings()) {
-            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.fromParts("package", getPackageName(), null)));
+            openAppSettings();
         } else {
             requestPermissions(new String[]{audioPermission()}, AUDIO_ACCESS);
         }
+    }
+
+    private void openAppSettings() {
+        startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", getPackageName(), null)));
     }
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode == AUDIO_ACCESS && results.length > 0) {
             getPreferences(MODE_PRIVATE).edit().putBoolean("askedForAudio", true).apply();
+            renderAudioAccess();
             watchDeviceLibrary();
             refreshLibrary();
         }
@@ -596,7 +835,7 @@ public final class MainActivity extends Activity {
         if (scanTask != null) {
             scanTask.cancel(true);
         }
-        Context app = getApplicationContext();
+        Context app = AppPreferences.configuredContext(getApplicationContext());
         scanTask = scanner.submit(() -> {
             List<Track> found = TrackLibrary.load(app, scanDevice);
             handler.post(() -> {
@@ -604,6 +843,7 @@ public final class MainActivity extends Activity {
                     tracks = found;
                     loaded = true;
                     renderLibrary();
+                    playlistPage.render();
                 }
             });
         });
@@ -616,7 +856,7 @@ public final class MainActivity extends Activity {
         String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
         List<Track> visible = new ArrayList<>();
         for (Track track : tracks) {
-            if (query.isEmpty() || track.title().toLowerCase(Locale.ROOT).contains(query)
+            if (query.isEmpty() || track.displayTitle(this).toLowerCase(Locale.ROOT).contains(query)
                     || track.artist().toLowerCase(Locale.ROOT).contains(query)) {
                 visible.add(track);
             }
@@ -641,27 +881,20 @@ public final class MainActivity extends Activity {
                     : hasAccess ? R.string.empty_title : R.string.welcome_title);
             emptyMessage.setText(hasTracks ? R.string.no_matches_description
                     : hasAccess ? R.string.empty_description : R.string.welcome_description);
-            emptyAction.setVisibility(hasTracks ? View.GONE : View.VISIBLE);
-            emptyAction.setText(hasAccess ? R.string.add_files : scanLabel);
-            emptyAction.setOnClickListener(view -> {
-                if (hasAccess) {
-                    openPicker();
-                } else {
-                    requestAudioAccess();
-                }
-            });
+            emptyAction.setVisibility(!hasTracks && !hasAccess ? View.VISIBLE : View.GONE);
+            emptyAction.setText(scanLabel);
         }
     }
 
-    private void selectTrack(Track track) {
+    private void selectTrack(List<Track> queue, Track track) {
         if (playback == null) {
             return;
         }
         hideKeyboard();
-        if (track.uri().equals(selectedTrack)) {
+        if (track.uri().equals(selectedTrack) && playback.hasQueue(queue)) {
             playback.toggle();
         } else {
-            playback.play(tracks, tracks.indexOf(track));
+            playback.play(queue, queue.indexOf(track));
         }
     }
 
@@ -671,17 +904,24 @@ public final class MainActivity extends Activity {
         if (!Objects.equals(selectedTrack, uri)) {
             selectedTrack = uri;
             adapter.notifyDataSetChanged();
+            playlistPage.trackAdapter.notifyDataSetChanged();
         }
         miniPlayer.setVisibility(current == null || keyboardOpen ? View.GONE : View.VISIBLE);
+        Bitmap artwork = current == null ? null : playback.currentArtwork();
+        displayArtwork(miniArtwork, artwork, R.drawable.ic_note, PLAYER_MUTED, 10);
+        displayArtwork(playerArtwork, artwork, R.drawable.ic_record, null, 8);
         if (current == null) {
-            showLibrary();
+            if (screen == Screen.PLAYER) {
+                showScreen(tab);
+            }
             return;
         }
         String artist = current.artist().isEmpty() ? getString(R.string.audio_file) : current.artist();
-        miniTitle.setText(current.title());
+        String title = current.displayTitle(this);
+        miniTitle.setText(title);
         miniArtist.setText(artist);
-        miniDetails.setContentDescription(getString(R.string.show_now_playing, current.title(), artist));
-        playerTitle.setText(current.title());
+        miniDetails.setContentDescription(getString(R.string.show_now_playing, title, artist));
+        playerTitle.setText(title);
         playerArtist.setText(artist);
         boolean playing = playback.isPlaybackRequested();
         for (ImageButton button : new ImageButton[]{miniToggle, playerToggle}) {
@@ -691,7 +931,7 @@ public final class MainActivity extends Activity {
         setEnabled(miniNext, playback.canSkipNext());
         setEnabled(playerNext, playback.canSkipNext());
         setEnabled(playerPrevious, playback.canSeek() || playback.canSkipPrevious());
-        if (playerOpen && playerScreen.getVisibility() != View.VISIBLE) {
+        if (screen == Screen.PLAYER && playerScreen.getVisibility() != View.VISIBLE) {
             openPlayer();
         }
         updateProgress();
@@ -720,27 +960,48 @@ public final class MainActivity extends Activity {
             return;
         }
         hideKeyboard();
-        playerOpen = true;
-        library.setVisibility(View.GONE);
-        playerScreen.setVisibility(View.VISIBLE);
+        showScreen(Screen.PLAYER);
         playerScreen.scrollTo(0, 0);
-        if (Build.VERSION.SDK_INT >= 33) {
-            backCallback = this::showLibrary;
-            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
-                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback);
+    }
+
+    private void goBack() {
+        if (screen == Screen.PLAYER) {
+            showScreen(tab);
+        } else if (screen != Screen.PLAYLISTS || !playlistPage.closePlaylist()) {
+            showScreen(Screen.LIBRARY);
         }
     }
 
-    private void showLibrary() {
-        if (Build.VERSION.SDK_INT >= 33 && backCallback != null) {
-            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backCallback);
-            backCallback = null;
+    private void showScreen(Screen target) {
+        screen = target;
+        playerScreen.setVisibility(target == Screen.PLAYER ? View.VISIBLE : View.GONE);
+        tabShell.setVisibility(target == Screen.PLAYER ? View.GONE : View.VISIBLE);
+        if (target != Screen.PLAYER) {
+            tab = target;
+            library.setVisibility(target == Screen.LIBRARY ? View.VISIBLE : View.GONE);
+            playlistPage.setVisibility(target == Screen.PLAYLISTS ? View.VISIBLE : View.GONE);
+            settingsScreen.setVisibility(target == Screen.SETTINGS ? View.VISIBLE : View.GONE);
+            navigationButtons.forEach((destination, button) -> {
+                boolean selected = destination == target;
+                int color = selected ? accent : muted;
+                button.setSelected(selected);
+                button.setTextColor(color);
+                button.getCompoundDrawablesRelative()[1].setTint(color);
+                button.setBackground(ripple(selected ? accentSurface : Color.TRANSPARENT, 14));
+            });
+            scrubbing = false;
+            scrubTrack = null;
         }
-        playerOpen = false;
-        scrubbing = false;
-        scrubTrack = null;
-        playerScreen.setVisibility(View.GONE);
-        library.setVisibility(View.VISIBLE);
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (target == Screen.LIBRARY && backCallback != null) {
+                getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backCallback);
+                backCallback = null;
+            } else if (target != Screen.LIBRARY && backCallback == null) {
+                backCallback = this::goBack;
+                getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                        OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback);
+            }
+        }
     }
 
     private void hideKeyboard() {
@@ -766,11 +1027,262 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private static String formatTime(long milliseconds) {
+    private String formatTime(long milliseconds) {
         long seconds = Math.max(0, milliseconds) / 1_000;
         return seconds < 3_600
-                ? String.format(Locale.getDefault(), "%d:%02d", seconds / 60, seconds % 60)
-                : String.format(Locale.getDefault(), "%d:%02d:%02d", seconds / 3_600, (seconds / 60) % 60, seconds % 60);
+                ? String.format(appLocale, "%d:%02d", seconds / 60, seconds % 60)
+                : String.format(appLocale, "%d:%02d:%02d", seconds / 3_600, (seconds / 60) % 60, seconds % 60);
+    }
+
+    private final class PlaylistPage extends LinearLayout {
+        private final List<Playlist> playlists = PlaylistStore.load(MainActivity.this);
+        private final TrackAdapter trackAdapter = new TrackAdapter();
+        private final BaseAdapter playlistAdapter = new BaseAdapter() {
+            @Override public int getCount() { return playlists.size(); }
+            @Override public Playlist getItem(int position) { return playlists.get(position); }
+            @Override public long getItemId(int position) { return position; }
+
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                TextView name = (TextView) recycled;
+                if (name == null) {
+                    name = singleLineText(16, ink, true);
+                    name.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+                    name.setMinHeight(dp(56));
+                    name.setPadding(dp(12), dp(8), dp(12), dp(8));
+                    name.setCompoundDrawablesRelative(smallIcon(R.drawable.ic_playlists, accent), null, null, null);
+                    name.setCompoundDrawablePadding(dp(12));
+                    name.setBackground(ripple(Color.TRANSPARENT, 14));
+                }
+                name.setText(getItem(position).name());
+                return name;
+            }
+        };
+
+        private final TextView title;
+        private final TextView empty;
+        private final ImageButton back;
+        private final ImageButton add;
+        private final ListView list;
+        private String selectedId;
+
+        PlaylistPage() {
+            super(MainActivity.this);
+            setOrientation(VERTICAL);
+            setPadding(dp(20), dp(6), dp(20), dp(10));
+
+            title = singleLineText(16, ink, true);
+            FrameLayout header = screenHeader(title);
+            back = iconButton(R.drawable.ic_back, R.string.back_to_playlists, accent, accentSurface,
+                    48, 24, this::closePlaylist);
+            add = iconButton(R.drawable.ic_add, R.string.create_playlist, accent, accentSurface,
+                    48, 24, this::addOrEditTracks);
+            addHeaderButton(header, back, Gravity.START);
+            addHeaderButton(header, add, Gravity.END);
+            addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
+
+            FrameLayout results = new FrameLayout(MainActivity.this);
+            LinearLayout.LayoutParams resultsSize = new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1);
+            resultsSize.topMargin = dp(10);
+            addView(results, resultsSize);
+            list = styledList();
+            list.setOnItemClickListener((parent, row, position, id) -> {
+                if (selectedId == null) {
+                    restoreSelection(playlists.get(position).id());
+                } else {
+                    selectTrack(trackAdapter.visible, trackAdapter.getItem(position));
+                }
+            });
+            list.setOnItemLongClickListener((parent, row, position, id) -> {
+                if (selectedId != null) {
+                    return false;
+                }
+                managePlaylist(playlists.get(position));
+                return true;
+            });
+            results.addView(list, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+
+            empty = text(0, 15, muted, false);
+            empty.setGravity(Gravity.CENTER);
+            empty.setPadding(dp(16), 0, dp(16), 0);
+            results.addView(empty, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER));
+            render();
+        }
+
+        void restoreSelection(String id) {
+            selectedId = id;
+            if (selectedPlaylist() == null) {
+                selectedId = null;
+            }
+            render();
+        }
+
+        boolean closePlaylist() {
+            if (selectedId == null) {
+                return false;
+            }
+            restoreSelection(null);
+            return true;
+        }
+
+        private Playlist selectedPlaylist() {
+            for (Playlist playlist : playlists) {
+                if (playlist.id().equals(selectedId)) {
+                    return playlist;
+                }
+            }
+            return null;
+        }
+
+        void render() {
+            Playlist playlist = selectedPlaylist();
+            title.setText(playlist == null ? getString(R.string.playlists) : playlist.name());
+            back.setVisibility(playlist == null ? View.INVISIBLE : View.VISIBLE);
+            add.setContentDescription(getString(playlist == null ? R.string.create_playlist : R.string.edit_playlist_tracks));
+
+            BaseAdapter activeAdapter = playlistAdapter;
+            int emptyMessage = R.string.no_playlists;
+            if (playlist != null) {
+                trackAdapter.visible = resolveTracks(playlist);
+                activeAdapter = trackAdapter;
+                emptyMessage = playlist.tracks().isEmpty() ? R.string.empty_playlist
+                        : loaded ? R.string.unavailable_playlist : R.string.loading;
+            }
+            if (list.getAdapter() != activeAdapter) {
+                list.setAdapter(activeAdapter);
+            } else {
+                activeAdapter.notifyDataSetChanged();
+            }
+            boolean hasRows = activeAdapter.getCount() > 0;
+            list.setVisibility(hasRows ? View.VISIBLE : View.GONE);
+            empty.setVisibility(hasRows ? View.GONE : View.VISIBLE);
+            empty.setText(emptyMessage);
+        }
+
+        private List<Track> resolveTracks(Playlist playlist) {
+            Map<String, Track> available = new HashMap<>();
+            for (Track track : tracks) {
+                available.put(track.libraryUri().toString(), track);
+            }
+            List<Track> members = new ArrayList<>();
+            for (String uri : playlist.tracks()) {
+                Track track = available.get(uri);
+                if (track != null) {
+                    members.add(track);
+                }
+            }
+            return members;
+        }
+
+        private void addOrEditTracks() {
+            Playlist playlist = selectedPlaylist();
+            if (playlist == null) {
+                editName(null);
+            } else {
+                editTracks(playlist);
+            }
+        }
+
+        private void editName(Playlist playlist) {
+            int title = playlist == null ? R.string.create_playlist : R.string.rename_playlist;
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(title));
+            EditText name = dialog.addInput(R.string.playlist_name, playlist == null ? "" : playlist.name());
+            Runnable save = () -> {
+                String value = name.getText().toString().trim();
+                if (value.isEmpty()) {
+                    name.setError(getString(R.string.playlist_name_required));
+                    return;
+                }
+                if (playlist == null) {
+                    Playlist created = new Playlist(UUID.randomUUID().toString(), value, Collections.emptyList());
+                    playlists.add(created);
+                    selectedId = created.id();
+                    savePlaylists();
+                } else {
+                    replacePlaylist(playlist, new Playlist(playlist.id(), value, playlist.tracks()));
+                }
+                dialog.dismiss();
+            };
+            name.setOnEditorActionListener((field, action, event) -> {
+                if (action == EditorInfo.IME_ACTION_DONE) {
+                    save.run();
+                    return true;
+                }
+                return false;
+            });
+            dialog.addCancel();
+            dialog.addAction(R.string.save, true, save);
+            dialog.show();
+        }
+
+        private void editTracks(Playlist playlist) {
+            List<Track> available = tracks;
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(R.string.edit_playlist_tracks));
+            if (available.isEmpty()) {
+                dialog.addMessage(getText(R.string.playlist_needs_tracks));
+                dialog.addAction(android.R.string.ok, true, dialog::dismiss);
+                dialog.show();
+                return;
+            }
+            CharSequence[] labels = new CharSequence[available.size()];
+            boolean[] checked = new boolean[available.size()];
+            Set<String> members = new LinkedHashSet<>(playlist.tracks());
+            for (int index = 0; index < available.size(); index++) {
+                Track track = available.get(index);
+                labels[index] = track.displayTitle(MainActivity.this);
+                checked[index] = members.contains(track.libraryUri().toString());
+            }
+            dialog.addChecklist(labels, checked);
+            dialog.addCancel();
+            dialog.addAction(R.string.save, true, () -> {
+                for (int index = 0; index < available.size(); index++) {
+                    String uri = available.get(index).libraryUri().toString();
+                    if (checked[index]) {
+                        members.add(uri);
+                    } else {
+                        members.remove(uri);
+                    }
+                }
+                replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), new ArrayList<>(members)));
+                dialog.dismiss();
+            });
+            dialog.show();
+        }
+
+        private void managePlaylist(Playlist playlist) {
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, playlist.name());
+            dialog.addMenuItem(R.string.rename_playlist, () -> {
+                dialog.dismiss();
+                editName(playlist);
+            });
+            dialog.addMenuItem(R.string.delete_playlist, () -> {
+                dialog.dismiss();
+                confirmDeletePlaylist(playlist);
+            });
+            dialog.addCancel();
+            dialog.show();
+        }
+
+        private void confirmDeletePlaylist(Playlist playlist) {
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(R.string.delete_playlist));
+            dialog.addMessage(getString(R.string.delete_playlist_message, playlist.name()));
+            dialog.addCancel();
+            dialog.addAction(R.string.delete_playlist, true, () -> {
+                playlists.remove(playlist);
+                savePlaylists();
+                dialog.dismiss();
+            });
+            dialog.show();
+        }
+
+        private void replacePlaylist(Playlist original, Playlist replacement) {
+            playlists.set(playlists.indexOf(original), replacement);
+            savePlaylists();
+        }
+
+        private void savePlaylists() {
+            PlaylistStore.save(MainActivity.this, playlists);
+            render();
+        }
     }
 
     private final class TrackAdapter extends BaseAdapter {
@@ -792,37 +1304,59 @@ public final class MainActivity extends Activity {
         private final TextView title;
         private final TextView artist;
         private final TextView duration;
+        private Track artworkTrack;
+        private Bitmap artwork;
+        private Future<?> artworkRequest;
+        private int artworkVersion;
 
         TrackRow() {
             super(MainActivity.this);
             setGravity(Gravity.CENTER_VERTICAL);
             setPadding(dp(8), dp(8), dp(10), dp(8));
             setMinimumHeight(dp(65));
-            icon = noteTile(SOFT_GREEN, GREEN, 12, 11);
+            icon = artworkTile(accentSurface, 12);
             addView(icon, new LinearLayout.LayoutParams(dp(44), dp(44)));
             LinearLayout labels = column();
             LinearLayout.LayoutParams labelSize = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1);
-            labelSize.leftMargin = dp(12);
-            labelSize.rightMargin = dp(10);
+            labelSize.setMarginStart(dp(12));
+            labelSize.setMarginEnd(dp(10));
             addView(labels, labelSize);
-            title = singleLineText(16, INK, true);
-            artist = singleLineText(13, MUTED, false);
+            title = singleLineText(16, ink, true);
+            artist = singleLineText(13, muted, false);
             labels.addView(title);
             addWithMargin(labels, artist, MATCH_PARENT, WRAP_CONTENT, 3);
-            duration = text(0, 13, MUTED, false);
+            duration = text(0, 13, muted, false);
             addView(duration);
         }
 
         void bind(Track track) {
             boolean selected = track.uri().equals(selectedTrack);
-            setBackground(ripple(selected ? SOFT_GREEN : Color.TRANSPARENT, 14));
+            setBackground(ripple(selected ? accentSurface : Color.TRANSPARENT, 14));
             setSelected(selected);
-            icon.setImageResource(selected ? R.drawable.ic_play : R.drawable.ic_note);
-            icon.setColorFilter(selected ? Color.WHITE : GREEN);
-            icon.setBackground(round(selected ? GREEN : SOFT_GREEN, 12));
-            title.setText(track.title());
+            if (!track.equals(artworkTrack)) {
+                artworkTrack = track;
+                artwork = null;
+                if (artworkRequest != null) {
+                    artworkRequest.cancel(false);
+                }
+                int version = ++artworkVersion;
+                artworkRequest = ArtworkLoader.load(MainActivity.this, track, ArtworkLoader.THUMBNAIL_SIZE, bitmap -> {
+                    if (version == artworkVersion && !isDestroyed()) {
+                        artwork = bitmap;
+                        renderArtwork(track.uri().equals(selectedTrack));
+                    }
+                });
+            }
+            renderArtwork(selected);
+            title.setText(track.displayTitle(MainActivity.this));
             artist.setText(track.artist().isEmpty() ? getString(R.string.audio_file) : track.artist());
             duration.setText(track.duration() > 0 ? formatTime(track.duration()) : "");
+        }
+
+        private void renderArtwork(boolean selected) {
+            icon.setBackground(round(selected ? accent : accentSurface, 12));
+            displayArtwork(icon, artwork, selected ? R.drawable.ic_play : R.drawable.ic_note,
+                    selected ? onAccent : accent, 11);
         }
     }
 
@@ -884,12 +1418,26 @@ public final class MainActivity extends Activity {
         return image;
     }
 
-    private ImageView noteTile(int fill, int color, int radius, int padding) {
-        ImageView tile = image(R.drawable.ic_note);
+    private ImageView artworkTile(int fill, int radius) {
+        ImageView tile = image(0);
         tile.setBackground(round(fill, radius));
-        tile.setColorFilter(color);
-        tile.setPadding(dp(padding), dp(padding), dp(padding), dp(padding));
+        tile.setClipToOutline(true);
+        tile.setScaleType(ImageView.ScaleType.CENTER_CROP);
         return tile;
+    }
+
+    private void displayArtwork(ImageView tile, Bitmap artwork, int fallback, Integer tint, int padding) {
+        int inset = artwork == null ? dp(padding) : 0;
+        tile.setPadding(inset, inset, inset, inset);
+        tile.clearColorFilter();
+        if (artwork != null) {
+            tile.setImageBitmap(artwork);
+        } else {
+            tile.setImageResource(fallback);
+            if (tint != null) {
+                tile.setColorFilter(tint);
+            }
+        }
     }
 
     private ImageButton iconButton(int icon, int label, int color, int fill, int size, int iconSize, Runnable action) {
@@ -920,7 +1468,7 @@ public final class MainActivity extends Activity {
     }
 
     private RippleDrawable ripple(int color, int radius) {
-        return new RippleDrawable(ColorStateList.valueOf(0x24488866), round(color, radius), round(Color.WHITE, radius));
+        return new RippleDrawable(ColorStateList.valueOf(rippleColor), round(color, radius), round(Color.WHITE, radius));
     }
 
     private void addWithMargin(LinearLayout parent, View child, int width, int height, int top) {

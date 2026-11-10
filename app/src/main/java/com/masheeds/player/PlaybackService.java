@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.Bitmap;
 import android.graphics.drawable.Icon;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -32,6 +33,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Future;
 
 public final class PlaybackService extends Service {
     private static final String CHANNEL = "playback";
@@ -60,11 +62,17 @@ public final class PlaybackService extends Service {
     private AudioManager audio;
     private AudioFocusRequest focusRequest;
     private NotificationManager notifications;
+    private Context localizedContext;
     private MediaSession session;
     private PendingIntent openApp;
     private MediaPlayer player;
+    private Bitmap currentArtwork;
+    private Bitmap notificationArtwork;
+    private Future<?> artworkRequest;
+    private int artworkVersion;
     private Runnable listener;
     private List<Track> queue = Collections.emptyList();
+    private RepeatMode repeatMode;
     private int index = -1;
     private boolean prepared;
     private boolean playWhenReady;
@@ -82,6 +90,7 @@ public final class PlaybackService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        repeatMode = RepeatMode.load(this);
         audio = getSystemService(AudioManager.class);
         focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(attributes)
@@ -89,8 +98,7 @@ public final class PlaybackService extends Service {
                 .setOnAudioFocusChangeListener(this::onFocusChanged, handler)
                 .build();
         notifications = getSystemService(NotificationManager.class);
-        notifications.createNotificationChannel(new NotificationChannel(CHANNEL,
-                getString(R.string.playback_channel), NotificationManager.IMPORTANCE_LOW));
+        refreshLanguage();
 
         openApp = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class)
                         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP),
@@ -150,8 +158,25 @@ public final class PlaybackService extends Service {
         this.listener = listener;
     }
 
+    void refreshLanguage() {
+        if (localizedContext != null && AppPreferences.locale(this).equals(
+                localizedContext.getResources().getConfiguration().getLocales().get(0))) {
+            return;
+        }
+        localizedContext = AppPreferences.configuredContext(this);
+        notifications.createNotificationChannel(new NotificationChannel(CHANNEL,
+                localizedContext.getString(R.string.playback_channel), NotificationManager.IMPORTANCE_LOW));
+        if (session != null) {
+            publishState();
+        }
+    }
+
     Track currentTrack() {
         return index >= 0 ? queue.get(index) : null;
+    }
+
+    Bitmap currentArtwork() {
+        return currentArtwork;
     }
 
     boolean isPlaybackRequested() {
@@ -159,11 +184,22 @@ public final class PlaybackService extends Service {
     }
 
     boolean canSkipNext() {
-        return index >= 0 && index + 1 < queue.size();
+        return index >= 0 && (index + 1 < queue.size() || wrapsQueue());
     }
 
     boolean canSkipPrevious() {
-        return index > 0;
+        return index > 0 || (index == 0 && wrapsQueue());
+    }
+
+    private boolean wrapsQueue() {
+        return repeatMode == RepeatMode.ALL && queue.size() > 1;
+    }
+
+    void setRepeatMode(RepeatMode mode) {
+        if (repeatMode != mode) {
+            repeatMode = mode;
+            publishState();
+        }
     }
 
     boolean canSeek() {
@@ -183,6 +219,10 @@ public final class PlaybackService extends Service {
         load(selectedIndex);
     }
 
+    boolean hasQueue(List<Track> tracks) {
+        return queue.equals(tracks);
+    }
+
     void toggle() {
         if (isPlaybackRequested()) {
             pause();
@@ -192,8 +232,8 @@ public final class PlaybackService extends Service {
     }
 
     void previous() {
-        if (index > 0 && position() < 3_000) {
-            load(index - 1);
+        if (canSkipPrevious() && position() < 3_000) {
+            load(index == 0 ? queue.size() - 1 : index - 1);
         } else {
             seek(0);
         }
@@ -201,7 +241,7 @@ public final class PlaybackService extends Service {
 
     void next() {
         if (canSkipNext()) {
-            load(index + 1);
+            load((index + 1) % queue.size());
         }
     }
 
@@ -246,16 +286,7 @@ public final class PlaybackService extends Service {
                     publishState();
                 }
             });
-            newPlayer.setOnCompletionListener(finished -> {
-                if (finished == player) {
-                    if (canSkipNext()) {
-                        next();
-                    } else {
-                        completed = true;
-                        pause();
-                    }
-                }
-            });
+            newPlayer.setOnCompletionListener(this::onTrackCompleted);
             newPlayer.setOnErrorListener((failed, what, extra) -> {
                 if (failed == player) {
                     failPlayback();
@@ -264,9 +295,38 @@ public final class PlaybackService extends Service {
             });
             newPlayer.setDataSource(this, currentTrack().uri());
             newPlayer.prepareAsync();
+            loadArtwork(currentTrack());
             publishState();
         } catch (IOException | RuntimeException error) {
             failPlayback();
+        }
+    }
+
+    private void loadArtwork(Track track) {
+        int version = artworkVersion;
+        artworkRequest = ArtworkLoader.load(this, track, ArtworkLoader.COVER_SIZE, bitmap -> {
+            if (version == artworkVersion && bitmap != null) {
+                currentArtwork = bitmap;
+                notificationArtwork = ArtworkLoader.fit(bitmap, 256);
+                publishState();
+            }
+        });
+    }
+
+    private void onTrackCompleted(MediaPlayer finished) {
+        if (finished != player) {
+            return;
+        }
+        completed = true;
+        if (!playWhenReady) {
+            return;
+        }
+        if (repeatMode == RepeatMode.ONE || (repeatMode == RepeatMode.ALL && queue.size() == 1)) {
+            startPlayback();
+        } else if (canSkipNext()) {
+            next();
+        } else {
+            pause();
         }
     }
 
@@ -275,7 +335,7 @@ public final class PlaybackService extends Service {
             return;
         }
         if (!enterForeground()) {
-            Toast.makeText(this, R.string.playback_error, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
             return;
         }
         interrupted = false;
@@ -292,7 +352,7 @@ public final class PlaybackService extends Service {
             hasFocus = audio.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
             if (!hasFocus) {
                 pause();
-                Toast.makeText(this, R.string.audio_focus_error, Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, localizedContext.getText(R.string.audio_focus_error), Toast.LENGTH_SHORT).show();
                 return;
             }
         }
@@ -400,11 +460,14 @@ public final class PlaybackService extends Service {
             if (canSeek()) {
                 actions |= PlaybackState.ACTION_SEEK_TO;
             }
-            session.setMetadata(new MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, track.title())
+            MediaMetadata.Builder metadata = new MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, track.displayTitle(localizedContext))
                     .putString(MediaMetadata.METADATA_KEY_ARTIST, track.artist())
-                    .putLong(MediaMetadata.METADATA_KEY_DURATION, prepared ? duration() : track.duration())
-                    .build());
+                    .putLong(MediaMetadata.METADATA_KEY_DURATION, prepared ? duration() : track.duration());
+            if (notificationArtwork != null) {
+                metadata.putBitmap(MediaMetadata.METADATA_KEY_ART, notificationArtwork);
+            }
+            session.setMetadata(metadata.build());
             session.setPlaybackState(new PlaybackState.Builder()
                     .setActions(actions)
                     .setState(state, position(), state == PlaybackState.STATE_PLAYING ? 1f : 0f)
@@ -422,7 +485,7 @@ public final class PlaybackService extends Service {
         boolean pause = playWhenReady;
         Notification.Builder builder = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_note)
-                .setContentTitle(track.title())
+                .setContentTitle(track.displayTitle(localizedContext))
                 .setContentText(track.artist())
                 .setContentIntent(openApp)
                 .setDeleteIntent(command(DISMISS, 4))
@@ -432,6 +495,9 @@ public final class PlaybackService extends Service {
                 .addAction(action(R.drawable.ic_previous, R.string.previous_track, PREVIOUS, 1))
                 .addAction(action(pause ? R.drawable.ic_pause : R.drawable.ic_play,
                         pause ? R.string.pause : R.string.play, TOGGLE, 2));
+        if (notificationArtwork != null) {
+            builder.setLargeIcon(notificationArtwork);
+        }
         if (canSkipNext()) {
             builder.addAction(action(R.drawable.ic_next, R.string.next_track, NEXT, 3));
         }
@@ -442,7 +508,7 @@ public final class PlaybackService extends Service {
     }
 
     private Notification.Action action(int icon, int title, String action, int requestCode) {
-        return new Notification.Action.Builder(Icon.createWithResource(this, icon), getString(title),
+        return new Notification.Action.Builder(Icon.createWithResource(this, icon), localizedContext.getText(title),
                 command(action, requestCode)).build();
     }
 
@@ -453,7 +519,7 @@ public final class PlaybackService extends Service {
 
     private void failPlayback() {
         clearSession();
-        Toast.makeText(this, R.string.playback_error, Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
     }
 
     private void clearSession() {
@@ -472,6 +538,13 @@ public final class PlaybackService extends Service {
     }
 
     private void releasePlayer() {
+        artworkVersion++;
+        if (artworkRequest != null) {
+            artworkRequest.cancel(false);
+            artworkRequest = null;
+        }
+        currentArtwork = null;
+        notificationArtwork = null;
         prepared = false;
         if (player != null) {
             player.release();
