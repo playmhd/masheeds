@@ -11,6 +11,7 @@ final class AppPreferences {
     private static final String DARK_THEME = "dark_theme";
     private static final String LANGUAGE = "language";
     private static final String NAVIGATION_HAPTICS = "navigation_haptics";
+    private static final String SHUFFLE = "shuffle";
 
     private AppPreferences() {}
 
@@ -37,6 +38,14 @@ final class AppPreferences {
 
     static void setNavigationHapticsEnabled(Context context, boolean enabled) {
         preferences(context).edit().putBoolean(NAVIGATION_HAPTICS, enabled).apply();
+    }
+
+    static boolean shuffleEnabled(Context context) {
+        return preferences(context).getBoolean(SHUFFLE, false);
+    }
+
+    static void setShuffleEnabled(Context context, boolean enabled) {
+        preferences(context).edit().putBoolean(SHUFFLE, enabled).apply();
     }
 
     static Context configuredContext(Context context) {

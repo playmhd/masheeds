@@ -4,3 +4,7 @@
 /local.properties
 **/build/
 *.iml
+.env
+.env.*
+!.env.example
+/supabase/.temp/

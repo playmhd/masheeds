@@ -43,6 +43,7 @@ public final class PlaybackService extends Service {
     private static final String NEXT = "next";
     private static final String DISMISS = "dismiss";
     private static final long CHECKPOINT_INTERVAL = 2_000L;
+    private static final long STREAM_EXPIRY_MARGIN = 15_000L;
 
     private final IBinder binder = new LocalBinder();
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -77,6 +78,10 @@ public final class PlaybackService extends Service {
     private MediaSession session;
     private PendingIntent openApp;
     private MediaPlayer player;
+    private int loadVersion;
+    private boolean requestingStream;
+    private long streamExpiresAt;
+    private int streamPosition;
     private Bitmap currentArtwork;
     private Bitmap notificationArtwork;
     private Future<?> artworkRequest;
@@ -90,6 +95,7 @@ public final class PlaybackService extends Service {
     private int activeSeek = -1;
     private boolean waitingForInitialSeek;
     private boolean prepared;
+    private boolean networkBuffering;
     private boolean playWhenReady;
     private boolean interrupted;
     private boolean completed;
@@ -107,6 +113,7 @@ public final class PlaybackService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         repeatMode = RepeatMode.load(this);
+        queue.setShuffle(AppPreferences.shuffleEnabled(this));
         lastCheckpoint = PlaybackCheckpoint.load(this);
         audio = getSystemService(AudioManager.class);
         focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -202,6 +209,12 @@ public final class PlaybackService extends Service {
         return playWhenReady;
     }
 
+    boolean isBuffering() {
+        Track track = currentTrack();
+        return track != null && track.isOnline()
+                && (activeSeek >= 0 || (playWhenReady && (!prepared || networkBuffering)));
+    }
+
     boolean canSkipNext() {
         return queue.canNext(repeatMode == RepeatMode.ALL);
     }
@@ -213,6 +226,12 @@ public final class PlaybackService extends Service {
     void setRepeatMode(RepeatMode mode) {
         if (repeatMode != mode) {
             repeatMode = mode;
+            publishState();
+        }
+    }
+
+    void setShuffle(boolean enabled) {
+        if (queue.setShuffle(enabled)) {
             publishState();
         }
     }
@@ -276,7 +295,11 @@ public final class PlaybackService extends Service {
     }
 
     int position() {
-        return requestedSeek >= 0 ? requestedSeek : prepared ? player.getCurrentPosition() : 0;
+        int position = requestedSeek >= 0 ? requestedSeek : prepared ? player.getCurrentPosition() : 0;
+        if (streamExpiresAt != 0 && prepared) {
+            streamPosition = position;
+        }
+        return position;
     }
 
     int duration() {
@@ -324,6 +347,13 @@ public final class PlaybackService extends Service {
         }
     }
 
+    void clearPrivatePlayback() {
+        Track track = currentTrack();
+        if (track != null && track.isPrivateOnline()) {
+            clearSession();
+        }
+    }
+
     void toggle() {
         if (isPlaybackRequested()) {
             pause();
@@ -356,6 +386,10 @@ public final class PlaybackService extends Service {
         }
         completed = false;
         requestedSeek = (int) Math.max(0, Math.min(position, duration()));
+        if (streamExpiring()) {
+            load(playWhenReady, requestedSeek);
+            return;
+        }
         if (activeSeek < 0) {
             seekToRequestedPosition();
         }
@@ -379,6 +413,36 @@ public final class PlaybackService extends Service {
             return;
         }
 
+        Track track = currentTrack();
+        if (track.isPrivateOnline()) {
+            int version = loadVersion;
+            requestingStream = true;
+            publishState();
+            DiscoverBackend.get(this).privatePlayback(track.onlineId(), result -> {
+                if (version != loadVersion) {
+                    return;
+                }
+                requestingStream = false;
+                if (!result.success()) {
+                    failPlayback();
+                    return;
+                }
+                DiscoverBackend.PlaybackGrant grant = result.value();
+                streamExpiresAt = SystemClock.elapsedRealtime() + grant.expiresIn() * 1_000L;
+                streamPosition = Math.max(0, requestedSeek);
+                prepareTrack(track, grant.url());
+            });
+        } else {
+            prepareTrack(track, track.uri());
+        }
+    }
+
+    private boolean streamExpiring() {
+        return streamExpiresAt != 0
+                && SystemClock.elapsedRealtime() >= streamExpiresAt - STREAM_EXPIRY_MARGIN;
+    }
+
+    private void prepareTrack(Track track, android.net.Uri source) {
         try {
             MediaPlayer newPlayer = new MediaPlayer();
             player = newPlayer;
@@ -426,11 +490,31 @@ public final class PlaybackService extends Service {
             newPlayer.setOnCompletionListener(this::onTrackCompleted);
             newPlayer.setOnErrorListener((failed, what, extra) -> {
                 if (failed == player) {
-                    failPlayback();
+                    if (streamExpiring()) {
+                        load(playWhenReady, requestedSeek >= 0 ? requestedSeek : streamPosition);
+                    } else {
+                        failPlayback();
+                    }
                 }
                 return true;
             });
-            newPlayer.setDataSource(this, currentTrack().uri());
+            if (track.isOnline()) {
+                newPlayer.setOnInfoListener((sourcePlayer, what, extra) -> {
+                    if (sourcePlayer != player || (what != MediaPlayer.MEDIA_INFO_BUFFERING_START
+                            && what != MediaPlayer.MEDIA_INFO_BUFFERING_END)) {
+                        return false;
+                    }
+                    boolean buffering = what == MediaPlayer.MEDIA_INFO_BUFFERING_START;
+                    if (buffering != networkBuffering) {
+                        networkBuffering = buffering;
+                        publishState();
+                    }
+                    return true;
+                });
+                newPlayer.setDataSource(source.toString());
+            } else {
+                newPlayer.setDataSource(this, source);
+            }
             newPlayer.prepareAsync();
             loadArtwork(currentTrack());
             publishState();
@@ -485,11 +569,15 @@ public final class PlaybackService extends Service {
     }
 
     private void resume() {
-        if (player == null || playWhenReady) {
+        if ((player == null && !requestingStream) || playWhenReady) {
             return;
         }
         if (sleepTimer.isDue(SystemClock.elapsedRealtime())) {
             clearTimer();
+        }
+        if (streamExpiring()) {
+            load(true, completed ? 0 : position());
+            return;
         }
         if (!enterForeground()) {
             Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
@@ -506,6 +594,10 @@ public final class PlaybackService extends Service {
 
     private void startPlayback() {
         if (expireTimerIfDue()) {
+            return;
+        }
+        if (streamExpiring()) {
+            load(true, completed ? 0 : position());
             return;
         }
         if (!hasFocus) {
@@ -614,7 +706,8 @@ public final class PlaybackService extends Service {
             session.setPlaybackState(null);
         } else if (hasStartedSession) {
             int state = playWhenReady
-                    ? (prepared && !waitingForInitialSeek ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_BUFFERING)
+                    ? (!prepared || waitingForInitialSeek || isBuffering()
+                            ? PlaybackState.STATE_BUFFERING : PlaybackState.STATE_PLAYING)
                     : PlaybackState.STATE_PAUSED;
             long actions = PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_PLAY
                     | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_SKIP_TO_PREVIOUS
@@ -684,10 +777,12 @@ public final class PlaybackService extends Service {
 
     private void failPlayback() {
         boolean showError = hasStartedSession || playWhenReady;
+        Track track = currentTrack();
+        int message = track != null && track.isOnline() ? R.string.stream_error : R.string.playback_error;
         prepared = false;
         clearSession();
         if (showError) {
-            Toast.makeText(this, localizedContext.getText(R.string.playback_error), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, localizedContext.getText(message), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -719,6 +814,9 @@ public final class PlaybackService extends Service {
         } catch (IllegalStateException ignored) {
             return;
         }
+        if (track.isOnline()) {
+            return;
+        }
         PlaybackCheckpoint checkpoint = new PlaybackCheckpoint(
                 track.libraryUri().toString(), savedPosition, queue.playlistId());
         if (!checkpoint.equals(lastCheckpoint)) {
@@ -728,11 +826,16 @@ public final class PlaybackService extends Service {
     }
 
     private void releasePlayer() {
+        loadVersion++;
+        requestingStream = false;
+        streamExpiresAt = 0;
+        streamPosition = 0;
         handler.removeCallbacks(checkpointTick);
         cancelArtworkRequest();
         currentArtwork = null;
         notificationArtwork = null;
         prepared = false;
+        networkBuffering = false;
         requestedSeek = -1;
         activeSeek = -1;
         waitingForInitialSeek = false;

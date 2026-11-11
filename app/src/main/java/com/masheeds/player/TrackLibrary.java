@@ -23,7 +23,30 @@ import java.util.Set;
 final class TrackLibrary {
     private static final String REMOVED_TRACKS = "removed_tracks";
 
-    record Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified) {
+    record Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified,
+                 Uri artworkUri, String album) {
+        Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified,
+              Uri artworkUri) {
+            this(uri, libraryUri, title, artist, duration, albumId, modified, artworkUri, "");
+        }
+
+        Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified) {
+            this(uri, libraryUri, title, artist, duration, albumId, modified, null);
+        }
+
+        boolean isOnline() {
+            return "masheeds".equals(libraryUri.getScheme())
+                    && ("discover".equals(libraryUri.getAuthority()) || isPrivateOnline());
+        }
+
+        boolean isPrivateOnline() {
+            return "masheeds".equals(libraryUri.getScheme()) && "uploads".equals(libraryUri.getAuthority());
+        }
+
+        String onlineId() {
+            return libraryUri.getLastPathSegment();
+        }
+
         String displayTitle(Context context) {
             return title.isEmpty() ? context.getString(R.string.untitled_track) : title;
         }

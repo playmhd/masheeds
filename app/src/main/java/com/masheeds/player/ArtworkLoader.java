@@ -25,10 +25,12 @@ final class ArtworkLoader {
     static final int THUMBNAIL_SIZE = 160;
     static final int COVER_SIZE = 896;
 
-    private record Key(Uri uri, Uri libraryUri, long albumId, long modified, long coverRevision, int size) {}
+    private record Key(Uri uri, Uri libraryUri, Uri artworkUri, long albumId, long modified, long coverRevision,
+                       int size) {}
     private record Result(Bitmap bitmap) {}
 
     private static final ExecutorService WORKERS = Executors.newFixedThreadPool(2);
+    private static final ExecutorService ONLINE_WORKERS = Executors.newFixedThreadPool(2);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final LruCache<Key, Result> CACHE = new LruCache<>(
             (int) Math.min(12 * 1024 * 1024, Runtime.getRuntime().maxMemory() / 16)) {
@@ -40,7 +42,8 @@ final class ArtworkLoader {
     private ArtworkLoader() {}
 
     static Future<?> load(Context context, Track track, int size, Consumer<Bitmap> onLoaded) {
-        Key key = new Key(track.uri(), track.libraryUri(), track.albumId(), track.modified(), CustomArtwork.revision(), size);
+        Key key = new Key(track.uri(), track.libraryUri(), track.artworkUri(), track.albumId(), track.modified(),
+                track.isOnline() ? 0 : CustomArtwork.revision(), size);
         Result cached = CACHE.get(key);
         if (cached != null) {
             MAIN.post(() -> onLoaded.accept(cached.bitmap()));
@@ -48,11 +51,14 @@ final class ArtworkLoader {
         }
 
         Context app = context.getApplicationContext();
-        return WORKERS.submit(() -> {
+        ExecutorService worker = track.isOnline() ? ONLINE_WORKERS : WORKERS;
+        return worker.submit(() -> {
             Result result = CACHE.get(key);
             if (result == null) {
                 result = new Result(read(app, track, size));
-                CACHE.put(key, result);
+                if (result.bitmap() != null || !track.isOnline() || track.artworkUri() == null) {
+                    CACHE.put(key, result);
+                }
             }
             Bitmap bitmap = result.bitmap();
             MAIN.post(() -> onLoaded.accept(bitmap));
@@ -68,6 +74,9 @@ final class ArtworkLoader {
     }
 
     private static Bitmap read(Context context, Track track, int size) {
+        if (track.isOnline()) {
+            return readOnlineArtwork(track.artworkUri(), size);
+        }
         Bitmap bitmap = CustomArtwork.load(context, track, size);
         if (bitmap != null) {
             return bitmap;
@@ -84,6 +93,17 @@ final class ArtworkLoader {
             bitmap = readThumbnail(context, track.libraryUri(), size);
         }
         return bitmap;
+    }
+
+    private static Bitmap readOnlineArtwork(Uri uri, int size) {
+        if (uri == null) {
+            return null;
+        }
+        try {
+            return decode(DiscoverBackend.downloadArtwork(uri), size);
+        } catch (IOException | RuntimeException ignored) {
+            return null;
+        }
     }
 
     private static Bitmap readEmbedded(Context context, Uri uri, int size) {

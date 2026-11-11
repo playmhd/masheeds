@@ -1,0 +1,4 @@
+project_id = "masheeds"
+
+[functions.private-music]
+verify_jwt = false

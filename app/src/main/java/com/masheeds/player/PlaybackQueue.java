@@ -13,17 +13,24 @@ import java.util.Set;
 
 final class PlaybackQueue {
     private List<Track> items = Collections.emptyList();
-    private List<Track> playlistOrder = Collections.emptyList();
+    private List<Track> sourceOrder = Collections.emptyList();
     private final Set<String> visited = new LinkedHashSet<>();
     private String playlistId;
     private int index = -1;
+    private boolean shuffle;
 
     void select(List<Track> tracks, int selected, String source) {
+        sourceOrder = new ArrayList<>(tracks);
         items = new ArrayList<>(tracks);
-        playlistOrder = source == null ? Collections.emptyList() : items;
         index = selected;
         playlistId = source;
         visited.clear();
+        if (shuffle && current() != null) {
+            Track current = items.remove(index);
+            Collections.shuffle(items);
+            items.add(0, current);
+            index = 0;
+        }
     }
 
     void clear() {
@@ -39,24 +46,55 @@ final class PlaybackQueue {
     }
 
     boolean matches(List<Track> tracks, String source) {
-        return Objects.equals(playlistId, source) && (source != null || items.equals(tracks));
+        return Objects.equals(playlistId, source) && (source != null || sourceOrder.equals(tracks));
     }
 
     void visitCurrent() {
-        if (playlistId != null && current() != null) {
+        if (current() != null) {
             visited.add(key(current()));
         }
     }
 
-    boolean updatePlaylist(String id, List<Track> tracks) {
-        if (!id.equals(playlistId) || current() == null || playlistOrder.equals(tracks)) {
+    boolean setShuffle(boolean enabled) {
+        if (shuffle == enabled) {
             return false;
         }
+        shuffle = enabled;
         Track current = current();
+        if (current != null) {
+            if (enabled || !restoreSourceOrder(current)) {
+                rebuildUpcoming(current);
+            }
+        }
+        return true;
+    }
+
+    private boolean restoreSourceOrder(Track current) {
         String currentKey = key(current);
-        playlistOrder = new ArrayList<>(tracks);
+        for (int position = 0; position < sourceOrder.size(); position++) {
+            if (key(sourceOrder.get(position)).equals(currentKey)) {
+                items = new ArrayList<>(sourceOrder);
+                items.set(position, current);
+                index = position;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    boolean updatePlaylist(String id, List<Track> tracks) {
+        if (!id.equals(playlistId) || current() == null || sourceOrder.equals(tracks)) {
+            return false;
+        }
+        sourceOrder = new ArrayList<>(tracks);
+        rebuildUpcoming(current());
+        return true;
+    }
+
+    private void rebuildUpcoming(Track current) {
+        String currentKey = key(current);
         Map<String, Track> available = new HashMap<>();
-        for (Track track : tracks) {
+        for (Track track : sourceOrder) {
             available.put(key(track), track);
         }
 
@@ -68,14 +106,16 @@ final class PlaybackQueue {
         }
         index = reordered.size();
         reordered.add(current);
-        for (Track track : tracks) {
+        for (Track track : sourceOrder) {
             String key = key(track);
             if (!key.equals(currentKey) && !visited.contains(key)) {
                 reordered.add(track);
             }
         }
+        if (shuffle) {
+            Collections.shuffle(reordered.subList(index + 1, reordered.size()));
+        }
         items = reordered;
-        return true;
     }
 
     boolean detachPlaylist(String id) {
@@ -83,7 +123,9 @@ final class PlaybackQueue {
             return false;
         }
         playlistId = null;
-        playlistOrder = Collections.emptyList();
+        if (!shuffle) {
+            sourceOrder = new ArrayList<>(items);
+        }
         visited.clear();
         return true;
     }
@@ -94,11 +136,8 @@ final class PlaybackQueue {
             return false;
         }
         index = items.indexOf(current);
-        if (playlistId != null) {
-            playlistOrder = new ArrayList<>(playlistOrder);
-            playlistOrder.removeIf(track -> key(track).equals(trackId));
-            visited.remove(trackId);
-        }
+        sourceOrder.removeIf(track -> key(track).equals(trackId));
+        visited.remove(trackId);
         return true;
     }
 
@@ -120,7 +159,7 @@ final class PlaybackQueue {
         if (index + 1 < items.size()) {
             index++;
         } else {
-            select(cycleOrder(), 0, playlistId);
+            wrap(true);
         }
     }
 
@@ -129,12 +168,27 @@ final class PlaybackQueue {
         if (index > 0) {
             index--;
         } else {
-            List<Track> order = cycleOrder();
-            int last = order.size() - 1;
-            if (key(order.get(last)).equals(key(current()))) {
-                last--;
+            wrap(false);
+        }
+    }
+
+    private void wrap(boolean forward) {
+        List<Track> order = cycleOrder();
+        int position = forward ? 0 : order.size() - 1;
+        if (shuffle) {
+            List<Track> shuffled = new ArrayList<>(order);
+            Collections.shuffle(shuffled);
+            if (shuffled.size() > 1 && key(shuffled.get(position)).equals(key(current()))) {
+                Collections.swap(shuffled, position, forward ? 1 : position - 1);
             }
-            select(order, last, playlistId);
+            items = shuffled;
+            index = position;
+            visited.clear();
+        } else {
+            if (!forward && key(order.get(position)).equals(key(current()))) {
+                position--;
+            }
+            select(order, position, playlistId);
         }
     }
 
@@ -144,7 +198,7 @@ final class PlaybackQueue {
     }
 
     private List<Track> cycleOrder() {
-        return playlistId == null ? items : playlistOrder;
+        return playlistId == null && !shuffle ? items : sourceOrder;
     }
 
     private static String key(Track track) {

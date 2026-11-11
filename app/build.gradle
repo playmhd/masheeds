@@ -2,6 +2,26 @@ plugins {
     id 'com.android.application'
 }
 
+def localConfig = new Properties()
+def localConfigFile = rootProject.file('local.properties')
+if (localConfigFile.isFile()) {
+    localConfigFile.withInputStream { localConfig.load(it) }
+}
+
+def configValue = { String name ->
+    providers.gradleProperty(name).orElse(providers.environmentVariable(name))
+            .getOrElse(localConfig.getProperty(name, '')).trim()
+}
+
+def publicConfig = { String name ->
+    def value = configValue(name)
+    if (name == 'SUPABASE_PUBLISHABLE_KEY' && !value.isEmpty()
+            && !value.startsWith('sb_publishable_')) {
+        throw new GradleException('SUPABASE_PUBLISHABLE_KEY must be a Supabase publishable key.')
+    }
+    groovy.json.JsonOutput.toJson(value)
+}
+
 android {
     namespace 'com.masheeds.player'
     compileSdk 36
@@ -11,8 +31,12 @@ android {
         applicationId 'com.masheeds.player'
         minSdk 26
         targetSdk 36
-        versionCode 4
-        versionName '1.3'
+        versionCode 5
+        versionName '1.4'
+        buildConfigField 'String', 'SUPABASE_URL', publicConfig('SUPABASE_URL')
+        buildConfigField 'String', 'SUPABASE_PUBLISHABLE_KEY', publicConfig('SUPABASE_PUBLISHABLE_KEY')
+        buildConfigField 'String', 'GOOGLE_WEB_CLIENT_ID', publicConfig('GOOGLE_WEB_CLIENT_ID')
+        buildConfigField 'boolean', 'PRIVATE_UPLOADS_ENABLED', (configValue('PRIVATE_UPLOADS_ENABLED') == 'true').toString()
     }
 
     buildFeatures {
@@ -30,4 +54,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    implementation 'androidx.credentials:credentials:1.5.0'
+    implementation 'androidx.credentials:credentials-play-services-auth:1.5.0'
+    implementation 'com.google.android.libraries.identity.googleid:googleid:1.1.1'
 }

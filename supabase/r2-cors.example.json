@@ -1,0 +1,9 @@
+[
+  {
+    "AllowedOrigins": ["https://music.example.com"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["Content-Type", "Content-Length", "If-None-Match", "Range"],
+    "ExposeHeaders": ["Accept-Ranges", "Content-Length", "Content-Range", "Content-Type", "ETag"],
+    "MaxAgeSeconds": 600
+  }
+]

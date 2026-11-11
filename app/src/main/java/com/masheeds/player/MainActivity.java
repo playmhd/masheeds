@@ -22,6 +22,7 @@ import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -43,6 +44,7 @@ import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -59,11 +61,14 @@ import android.window.OnBackInvokedDispatcher;
 import com.masheeds.player.TrackLibrary.Track;
 import com.masheeds.player.PlaylistStore.Playlist;
 
+import java.text.DateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -85,10 +90,11 @@ public final class MainActivity extends Activity {
     private static final int PLAYER_MUTED = 0xFFC5D9CB;
     private static final int THUMBNAIL_DP = 48;
     private static final int PICK_FILES = 1;
+    private static final int PICK_PRIVATE_MUSIC = 40;
     private static final int AUDIO_ACCESS = 2;
     private static final int PICK_COVER = 3;
 
-    private enum Screen { LIBRARY, PLAYLISTS, DISCOVER, SETTINGS, PLAYER }
+    private enum Screen { LIBRARY, PLAYLISTS, DISCOVER, SETTINGS, RECENTLY_DELETED, PLAYER }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService scanner = Executors.newSingleThreadExecutor();
@@ -111,6 +117,7 @@ public final class MainActivity extends Activity {
             playback = ((PlaybackService.LocalBinder) binder).service();
             playback.refreshLanguage();
             playback.setRepeatMode(repeatMode);
+            playback.setShuffle(shuffleEnabled);
             playback.setListener(MainActivity.this::renderPlayback);
             maybeRestorePlayback();
             renderPlayback();
@@ -126,8 +133,10 @@ public final class MainActivity extends Activity {
     private Screen screen = Screen.LIBRARY;
     private Screen tab = Screen.LIBRARY;
     private RepeatMode repeatMode;
+    private boolean shuffleEnabled;
     private Locale appLocale;
     private boolean darkMode;
+    private boolean resumed;
     private int ink;
     private int muted;
     private int accent;
@@ -142,6 +151,7 @@ public final class MainActivity extends Activity {
     private boolean restoreLibraryReady;
     private boolean restoreAttempted;
     private String pendingCoverKey;
+    private String pendingUploadOwner;
     private long coverRevision;
     private boolean keyboardOpen;
     private OnBackInvokedCallback backCallback;
@@ -177,6 +187,7 @@ public final class MainActivity extends Activity {
     private ProgressBar miniProgress;
     private ScrollView playerScreen;
     private ImageView playerArtwork;
+    private ImageButton playerArtworkAction;
     private TextView playerTitle;
     private TextView playerArtist;
     private TextView elapsed;
@@ -185,14 +196,18 @@ public final class MainActivity extends Activity {
     private ImageButton playerToggle;
     private ImageButton playerNext;
     private ImageButton playerPrevious;
+    private ImageButton playerShuffle;
     private ImageButton playerRepeat;
     private ImageButton playerTimer;
     private TextView timerStatus;
     private Button cancelTimer;
     private BaseAdapter timerChoices;
-    private LinearLayout discoverScreen;
+    private DiscoverPage discoverScreen;
     private ScrollView settingsScreen;
+    private RecentlyDeletedPage recentlyDeletedPage;
     private TextView audioAccessSummary;
+    private TextView accountStatus;
+    private Button accountAction;
 
     @Override protected void attachBaseContext(Context base) {
         super.attachBaseContext(AppPreferences.configuredContext(base));
@@ -201,6 +216,7 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         repeatMode = RepeatMode.load(this);
+        shuffleEnabled = AppPreferences.shuffleEnabled(this);
         appLocale = AppPreferences.locale(this);
         darkMode = AppPreferences.isDark(this);
         ink = getColor(R.color.text_primary);
@@ -235,16 +251,27 @@ public final class MainActivity extends Activity {
         playerScreen.setVisibility(View.GONE);
         content.addView(playerScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         renderRepeatMode();
+        renderShuffle();
         showScreen(Screen.LIBRARY);
         setContentView(root);
         if (state != null) {
             pendingCoverKey = state.getString("pendingCover");
+            pendingUploadOwner = state.getString("pendingUploadOwner");
             search.setText(state.getString("query", ""));
+            String albumName = state.getString("discoverAlbum");
+            if (albumName != null) {
+                discoverScreen.selectedAlbum = new DiscoverPage.AlbumKey(
+                        albumName, state.getString("discoverAlbumArtist", ""));
+                discoverScreen.section = DiscoverPage.Section.ALBUM;
+            } else if (state.getBoolean("discoverAllTracks")) {
+                discoverScreen.section = DiscoverPage.Section.ALL;
+            }
+            discoverScreen.search.setText(state.getString("discoverQuery", ""));
             String savedScreen = state.getString("screen");
             String savedTab = state.getString("tab", savedScreen);
             playlistPage.restoreSelection(state.getString("playlist"));
-            for (Screen destination : navigationButtons.keySet()) {
-                if (destination.name().equals(savedTab)) {
+            for (Screen destination : Screen.values()) {
+                if (destination != Screen.PLAYER && destination.name().equals(savedTab)) {
                     showScreen(destination);
                     break;
                 }
@@ -292,9 +319,24 @@ public final class MainActivity extends Activity {
 
     @Override public void onResume() {
         super.onResume();
+        resumed = true;
         renderAudioAccess();
+        if (screen == Screen.DISCOVER) {
+            discoverScreen.open();
+        } else if (screen == Screen.SETTINGS) {
+            discoverScreen.refreshAccount();
+        }
+        if (screen == Screen.RECENTLY_DELETED) {
+            recentlyDeletedPage.refresh();
+        }
         watchDeviceLibrary();
         refreshLibrary();
+    }
+
+    @Override public void onPause() {
+        resumed = false;
+        discoverScreen.cancelCatalogRefresh();
+        super.onPause();
     }
 
     private void watchDeviceLibrary() {
@@ -325,6 +367,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override public void onDestroy() {
+        discoverScreen.cancelSignIn();
         handler.removeCallbacksAndMessages(null);
         scanner.shutdownNow();
         super.onDestroy();
@@ -332,7 +375,14 @@ public final class MainActivity extends Activity {
 
     @Override public void onSaveInstanceState(Bundle state) {
         state.putString("pendingCover", pendingCoverKey);
+        state.putString("pendingUploadOwner", pendingUploadOwner);
         state.putString("query", search.getText().toString());
+        state.putBoolean("discoverAllTracks", discoverScreen.section == DiscoverPage.Section.ALL);
+        if (discoverScreen.selectedAlbum != null) {
+            state.putString("discoverAlbum", discoverScreen.selectedAlbum.name());
+            state.putString("discoverAlbumArtist", discoverScreen.selectedAlbum.artist());
+        }
+        state.putString("discoverQuery", discoverScreen.search.getText().toString());
         state.putString("screen", screen.name());
         state.putString("tab", tab.name());
         state.putString("playlist", playlistPage.selectedId);
@@ -356,12 +406,14 @@ public final class MainActivity extends Activity {
         shell.addView(pages, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
         library = buildLibrary();
         playlistPage = new PlaylistPage();
-        discoverScreen = buildDiscoverScreen();
+        discoverScreen = new DiscoverPage();
         settingsScreen = buildSettingsScreen();
+        recentlyDeletedPage = new RecentlyDeletedPage();
         pages.addView(library, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(playlistPage, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(discoverScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(settingsScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        pages.addView(recentlyDeletedPage, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
 
         miniPlayer = buildMiniPlayer();
         miniPlayer.setVisibility(View.GONE);
@@ -388,7 +440,7 @@ public final class MainActivity extends Activity {
         navigation.setPadding(dp(4), dp(6), dp(4), dp(6));
         navigation.setMinimumHeight(dp(56));
         navigation.setOnClickListener(view -> {
-            if (screen != destination && AppPreferences.navigationHapticsEnabled(this)) {
+            if (navigationTab(screen) != destination && AppPreferences.navigationHapticsEnabled(this)) {
                 int feedback = Build.VERSION.SDK_INT >= 34
                         ? HapticFeedbackConstants.SEGMENT_TICK : HapticFeedbackConstants.CLOCK_TICK;
                 view.performHapticFeedback(feedback);
@@ -595,13 +647,13 @@ public final class MainActivity extends Activity {
         playerArtwork.setScaleType(ImageView.ScaleType.FIT_CENTER);
         FrameLayout coverPanel = new FrameLayout(this);
         coverPanel.addView(playerArtwork, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
-        ImageButton addToPlaylist = iconButton(R.drawable.ic_add_to_playlist, R.string.add_to_playlist,
-                accent, accentSurface, 48, 22, this::openAddToPlaylist);
+        playerArtworkAction = iconButton(R.drawable.ic_add_to_playlist, R.string.add_to_playlist,
+                accent, accentSurface, 48, 22, this::onPlayerArtworkAction);
         FrameLayout.LayoutParams actionPosition =
                 new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.BOTTOM);
         actionPosition.setMarginEnd(dp(10));
         actionPosition.bottomMargin = dp(10);
-        coverPanel.addView(addToPlaylist, actionPosition);
+        coverPanel.addView(playerArtworkAction, actionPosition);
         addWithMargin(page, coverPanel, coverSize, coverSize, 22);
 
         playerTitle = text(0, 27, ink, true);
@@ -653,36 +705,33 @@ public final class MainActivity extends Activity {
         LinearLayout buttons = row();
         buttons.setGravity(Gravity.CENTER);
         buttons.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
-        playerPrevious = iconButton(R.drawable.ic_previous, R.string.previous_track, accent, accentSurface, 54, 26,
+        boolean compactControls = width < 348;
+        int skipSize = compactControls ? 48 : 54;
+        int playSize = compactControls ? 64 : 72;
+        int gap = dp(compactControls ? 4 : 8);
+        playerShuffle = iconButton(R.drawable.ic_shuffle, R.string.shuffle_off, muted, surface,
+                48, 24, this::toggleShuffle);
+        playerPrevious = iconButton(R.drawable.ic_previous, R.string.previous_track, accent, accentSurface, skipSize, 26,
                 () -> withPlayback(PlaybackService::previous));
-        playerToggle = iconButton(R.drawable.ic_play, R.string.play, onAccent, accent, 72, 34,
+        playerToggle = iconButton(R.drawable.ic_play, R.string.play, onAccent, accent, playSize, 34,
                 () -> withPlayback(PlaybackService::toggle));
-        playerNext = iconButton(R.drawable.ic_next, R.string.next_track, accent, accentSurface, 54, 26,
+        playerNext = iconButton(R.drawable.ic_next, R.string.next_track, accent, accentSurface, skipSize, 26,
                 () -> withPlayback(PlaybackService::next));
         playerRepeat = iconButton(R.drawable.ic_repeat, repeatMode.label, muted, surface,
                 48, 24, this::cycleRepeatMode);
-        buttons.addView(playerPrevious, new LinearLayout.LayoutParams(dp(54), dp(54)));
-        LinearLayout.LayoutParams toggleSize = new LinearLayout.LayoutParams(dp(72), dp(72));
-        toggleSize.setMargins(dp(12), 0, dp(12), 0);
+        LinearLayout.LayoutParams shuffleSize = new LinearLayout.LayoutParams(dp(48), dp(48));
+        shuffleSize.setMarginEnd(gap);
+        buttons.addView(playerShuffle, shuffleSize);
+        buttons.addView(playerPrevious, new LinearLayout.LayoutParams(dp(skipSize), dp(skipSize)));
+        LinearLayout.LayoutParams toggleSize = new LinearLayout.LayoutParams(dp(playSize), dp(playSize));
+        toggleSize.setMargins(gap, 0, gap, 0);
         buttons.addView(playerToggle, toggleSize);
-        buttons.addView(playerNext, new LinearLayout.LayoutParams(dp(54), dp(54)));
+        buttons.addView(playerNext, new LinearLayout.LayoutParams(dp(skipSize), dp(skipSize)));
         LinearLayout.LayoutParams repeatSize = new LinearLayout.LayoutParams(dp(48), dp(48));
-        repeatSize.setMarginStart(dp(12));
+        repeatSize.setMarginStart(gap);
         buttons.addView(playerRepeat, repeatSize);
         addWithMargin(page, buttons, MATCH_PARENT, WRAP_CONTENT, 22);
         return screen;
-    }
-
-    private LinearLayout buildDiscoverScreen() {
-        LinearLayout page = column();
-        page.setPadding(dp(20), dp(6), dp(20), dp(10));
-        page.addView(screenHeader(text(R.string.discover, 16, ink, true)),
-                new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
-
-        TextView message = text(R.string.discover_placeholder, 15, muted, false);
-        message.setGravity(Gravity.CENTER);
-        page.addView(message, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
-        return page;
     }
 
     private ScrollView buildSettingsScreen() {
@@ -749,6 +798,22 @@ public final class MainActivity extends Activity {
         Button audioAccess = button(R.string.audio_access, accent, accentSurface);
         audioAccess.setOnClickListener(view -> openAppSettings());
         addWithMargin(accessCard, audioAccess, WRAP_CONTENT, dp(48), 8);
+        Button recentlyDeleted = button(R.string.recently_deleted, accent, accentSurface);
+        recentlyDeleted.setOnClickListener(view -> showScreen(Screen.RECENTLY_DELETED));
+        addWithMargin(accessCard, recentlyDeleted, WRAP_CONTENT, dp(48), 8);
+
+        TextView accountSection = text(R.string.account, 18, ink, true);
+        markHeading(accountSection);
+        addWithMargin(page, accountSection, MATCH_PARENT, WRAP_CONTENT, 24);
+        LinearLayout accountCard = column();
+        accountCard.setPadding(dp(14), dp(14), dp(14), dp(14));
+        accountCard.setBackground(round(surface, 16));
+        addWithMargin(page, accountCard, MATCH_PARENT, WRAP_CONTENT, 10);
+        accountStatus = text(R.string.account_signed_out, 15, muted, false);
+        accountCard.addView(accountStatus);
+        accountAction = button(R.string.google_sign_in, accent, accentSurface);
+        accountAction.setOnClickListener(view -> discoverScreen.toggleAccount());
+        addWithMargin(accountCard, accountAction, WRAP_CONTENT, dp(48), 8);
 
         TextView version = text(0, 14, muted, false);
         version.setText(getString(R.string.app_version, BuildConfig.VERSION_NAME));
@@ -813,6 +878,20 @@ public final class MainActivity extends Activity {
         playerRepeat.setContentDescription(getString(R.string.change_repeat_mode, getString(repeatMode.label)));
     }
 
+    private void toggleShuffle() {
+        shuffleEnabled = !shuffleEnabled;
+        AppPreferences.setShuffleEnabled(this, shuffleEnabled);
+        renderShuffle();
+        withPlayback(service -> service.setShuffle(shuffleEnabled));
+    }
+
+    private void renderShuffle() {
+        playerShuffle.setSelected(shuffleEnabled);
+        playerShuffle.setColorFilter(shuffleEnabled ? onAccent : muted);
+        playerShuffle.setBackground(ripple(shuffleEnabled ? accent : surface, 24));
+        playerShuffle.setContentDescription(getString(shuffleEnabled ? R.string.shuffle_on : R.string.shuffle_off));
+    }
+
     private void renderAudioAccess() {
         audioAccessSummary.setText(hasAudioAccess() ? R.string.audio_access_allowed : R.string.audio_access_needed);
     }
@@ -834,6 +913,14 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_PRIVATE_MUSIC) {
+            String owner = pendingUploadOwner;
+            pendingUploadOwner = null;
+            if (owner != null && resultCode == RESULT_OK && data != null && data.getData() != null) {
+                discoverScreen.upload(data.getData(), owner);
+            }
+            return;
+        }
         if (requestCode == PICK_COVER) {
             String key = pendingCoverKey;
             pendingCoverKey = null;
@@ -903,6 +990,7 @@ public final class MainActivity extends Activity {
             String trackId = track.libraryUri().toString();
             TrackLibrary.remove(this, track);
             playlistPage.removeTrackFromAll(trackId);
+            RecentlyDeleted.record(this, Collections.singletonList(track), null);
             withPlayback(service -> service.removeTrack(trackId));
             PlaybackCheckpoint.forgetTrack(this, trackId);
 
@@ -1114,16 +1202,19 @@ public final class MainActivity extends Activity {
 
     private void renderPlayback() {
         Track current = playback == null ? null : playback.currentTrack();
-        Uri uri = current == null ? null : current.uri();
+        Uri uri = current == null ? null : current.libraryUri();
         if (!Objects.equals(selectedTrack, uri)) {
             selectedTrack = uri;
             adapter.notifyDataSetChanged();
             playlistPage.trackAdapter.notifyDataSetChanged();
+            discoverScreen.trackAdapter.notifyDataSetChanged();
+            discoverScreen.bindQuickPickRows();
         }
         miniPlayer.setVisibility(current == null || keyboardOpen ? View.GONE : View.VISIBLE);
         Bitmap artwork = current == null ? null : playback.currentArtwork();
         displayArtwork(miniArtwork, artwork, R.drawable.ic_note, PLAYER_MUTED, 10);
         displayArtwork(playerArtwork, artwork, R.drawable.ic_record, null, 8);
+        renderPlayerArtworkAction(current);
         boolean timerActive = sleepTimerActive();
         playerTimer.setBackground(ripple(timerActive ? accent : accentSurface, 24));
         playerTimer.setColorFilter(timerActive ? onAccent : accent);
@@ -1137,11 +1228,12 @@ public final class MainActivity extends Activity {
         }
         String artist = current.artist().isEmpty() ? getString(R.string.audio_file) : current.artist();
         String title = current.displayTitle(this);
+        String subtitle = playback.isBuffering() ? getString(R.string.stream_buffering) : artist;
         miniTitle.setText(title);
-        miniArtist.setText(artist);
-        miniDetails.setContentDescription(getString(R.string.show_now_playing, title, artist));
+        miniArtist.setText(subtitle);
+        miniDetails.setContentDescription(getString(R.string.show_now_playing, title, subtitle));
         playerTitle.setText(title);
-        playerArtist.setText(artist);
+        playerArtist.setText(subtitle);
         boolean playing = playback.isPlaybackRequested();
         for (ImageButton button : new ImageButton[]{miniToggle, playerToggle}) {
             button.setImageResource(playing ? R.drawable.ic_pause : R.drawable.ic_play);
@@ -1179,10 +1271,30 @@ public final class MainActivity extends Activity {
         return playback != null && (playback.sleepTimerMinutes() > 0 || playback.sleepTimerEndsWithTrack());
     }
 
-    private void openAddToPlaylist() {
+    private void onPlayerArtworkAction() {
         Track track = playback == null ? null : playback.currentTrack();
         if (track != null) {
-            playlistPage.addTrack(track);
+            if (track.isOnline()) {
+                discoverScreen.toggleLike(track);
+            } else {
+                playlistPage.addTrack(track);
+            }
+        }
+    }
+
+    private void renderPlayerArtworkAction(Track track) {
+        boolean online = track != null && track.isOnline();
+        if (track != null && track.isPrivateOnline()) {
+            playerArtworkAction.setVisibility(View.GONE);
+            return;
+        }
+        playerArtworkAction.setVisibility(!online || discoverScreen.canLike() ? View.VISIBLE : View.GONE);
+        if (online) {
+            discoverScreen.bindLikeButton(playerArtworkAction, track);
+        } else {
+            playerArtworkAction.setImageResource(R.drawable.ic_add_to_playlist);
+            playerArtworkAction.setContentDescription(getString(R.string.add_to_playlist));
+            setEnabled(playerArtworkAction, true);
         }
     }
 
@@ -1256,6 +1368,10 @@ public final class MainActivity extends Activity {
     private void goBack() {
         if (screen == Screen.PLAYER) {
             showScreen(tab);
+        } else if (screen == Screen.RECENTLY_DELETED) {
+            showScreen(Screen.SETTINGS);
+        } else if (screen == Screen.DISCOVER && discoverScreen.goBack()) {
+            return;
         } else if (screen != Screen.PLAYLISTS || !playlistPage.goBack()) {
             showScreen(Screen.LIBRARY);
         }
@@ -1266,6 +1382,9 @@ public final class MainActivity extends Activity {
             playlistPage.finishReordering();
         }
         screen = target;
+        if (target != Screen.DISCOVER) {
+            discoverScreen.cancelCatalogRefresh();
+        }
         playerScreen.setVisibility(target == Screen.PLAYER ? View.VISIBLE : View.GONE);
         tabShell.setVisibility(target == Screen.PLAYER ? View.GONE : View.VISIBLE);
         if (target != Screen.PLAYER) {
@@ -1274,8 +1393,18 @@ public final class MainActivity extends Activity {
             playlistPage.setVisibility(target == Screen.PLAYLISTS ? View.VISIBLE : View.GONE);
             discoverScreen.setVisibility(target == Screen.DISCOVER ? View.VISIBLE : View.GONE);
             settingsScreen.setVisibility(target == Screen.SETTINGS ? View.VISIBLE : View.GONE);
+            recentlyDeletedPage.setVisibility(target == Screen.RECENTLY_DELETED ? View.VISIBLE : View.GONE);
+            if (target == Screen.RECENTLY_DELETED) {
+                recentlyDeletedPage.refresh();
+            }
+            if (target == Screen.DISCOVER) {
+                discoverScreen.open();
+            } else if (target == Screen.SETTINGS) {
+                discoverScreen.refreshAccount();
+            }
+            Screen selectedTab = navigationTab(target);
             navigationButtons.forEach((destination, button) -> {
-                boolean selected = destination == target;
+                boolean selected = destination == selectedTab;
                 int color = selected ? accent : muted;
                 button.setSelected(selected);
                 button.setTextColor(color);
@@ -1297,10 +1426,18 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private static Screen navigationTab(Screen page) {
+        return page == Screen.RECENTLY_DELETED ? Screen.SETTINGS : page;
+    }
+
     private void hideKeyboard() {
-        getSystemService(InputMethodManager.class).hideSoftInputFromWindow(search.getWindowToken(), 0);
-        search.clearFocus();
-        library.requestFocus();
+        getSystemService(InputMethodManager.class).hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(), 0);
+        if (discoverScreen.search.hasFocus()) {
+            discoverScreen.requestFocus();
+        } else {
+            search.clearFocus();
+            library.requestFocus();
+        }
     }
 
     private void withPlayback(java.util.function.Consumer<PlaybackService> action) {
@@ -1325,6 +1462,895 @@ public final class MainActivity extends Activity {
         return seconds < 3_600
                 ? String.format(appLocale, "%d:%02d", seconds / 60, seconds % 60)
                 : String.format(appLocale, "%d:%02d:%02d", seconds / 3_600, (seconds / 60) % 60, seconds % 60);
+    }
+
+    private final class DiscoverPage extends LinearLayout {
+        private static final int QUICK_PICK_ROWS_PER_COLUMN = 4;
+        private static final int QUICK_PICK_LIMIT = 3 * QUICK_PICK_ROWS_PER_COLUMN;
+        private enum Load { IDLE, LOADING, READY, ERROR }
+        private enum Section { BROWSE, ALL, ALBUM, LIKED, UPLOADS }
+
+        private record AlbumKey(String name, String artist) {
+            static AlbumKey of(Track track) { return new AlbumKey(track.album(), track.artist().trim()); }
+        }
+
+        private final DiscoverBackend backend = DiscoverBackend.get(MainActivity.this);
+        private final Runnable refreshStaleCatalog = () -> loadCatalog(false);
+        private final TextView headerTitle;
+        private final ImageButton browseBack;
+        private final ImageButton refreshCatalog;
+        private final Button browseTab;
+        private final Button likedTab;
+        private final Button uploadsTab;
+        private final ImageButton uploadButton;
+        private final TextView uploadStatus;
+        private final ProgressBar uploadProgress;
+        private final EditText search;
+        private final Button catalogRetry;
+        private final LinearLayout quickPicksHeader;
+        private final ScrollView browseResults;
+        private final LinearLayout quickPickColumns;
+        private final LinearLayout albumsSection;
+        private final LinearLayout albumCards;
+        private final List<TrackRow> quickPickRows = new ArrayList<>();
+        private final ListView list;
+        private final TextView status;
+        private final Button statusAction;
+        private final BaseAdapter trackAdapter = new BaseAdapter() {
+            @Override public int getCount() { return visible.size(); }
+            @Override public Track getItem(int position) { return visible.get(position); }
+            @Override public long getItemId(int position) { return position; }
+
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                TrackRow row = recycled == null ? new TrackRow() : (TrackRow) recycled;
+                Track track = getItem(position);
+                row.bind(track);
+                if (!track.isPrivateOnline()) {
+                    bindRowLike(row, track);
+                } else if (row.likeButton != null) {
+                    row.likeButton.setVisibility(View.GONE);
+                }
+                return row;
+            }
+        };
+
+        private DiscoverBackend.CatalogSnapshot catalog;
+        private List<Track> uploads = Collections.emptyList();
+        private List<Track> visible = Collections.emptyList();
+        private List<Track> quickPickTracks = Collections.emptyList();
+        private Map<AlbumKey, Track> albumCovers = Collections.emptyMap();
+        private AlbumKey selectedAlbum;
+        private Set<String> likes = Collections.emptySet();
+        private final Set<String> pendingLikes = new LinkedHashSet<>();
+        private DiscoverBackend.Account account;
+        private CancellationSignal signInRequest;
+        private int accountGeneration;
+        private boolean accountBusy;
+        private int accountError;
+        private Section section = Section.BROWSE;
+        private boolean uploading;
+        private int uploadedPercent = -1;
+        private Load catalogState = Load.IDLE;
+        private Load likesState = Load.IDLE;
+        private Load uploadsState = Load.IDLE;
+
+        DiscoverPage() {
+            super(MainActivity.this);
+            setOrientation(VERTICAL);
+            setPadding(dp(20), dp(6), dp(20), dp(10));
+            setFocusableInTouchMode(true);
+            headerTitle = singleLineText(16, ink, true);
+            headerTitle.setText(R.string.discover);
+            FrameLayout header = screenHeader(headerTitle);
+            browseBack = iconButton(R.drawable.ic_back, R.string.discover_back_to_browse,
+                    accent, accentSurface, 48, 24, this::goBack);
+            browseBack.setVisibility(View.GONE);
+            addHeaderButton(header, browseBack, Gravity.START);
+            refreshCatalog = iconButton(R.drawable.ic_refresh, R.string.discover_refresh,
+                    accent, accentSurface, 48, 24, () -> loadCatalog(true));
+            addHeaderButton(header, refreshCatalog, Gravity.END);
+            uploadButton = iconButton(R.drawable.ic_add, R.string.upload_track, accent, accentSurface,
+                    48, 24, this::pickUpload);
+            uploadButton.setVisibility(View.GONE);
+            addHeaderButton(header, uploadButton, Gravity.END);
+            addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
+
+            LinearLayout tabs = row();
+            browseTab = button(R.string.discover_browse, accent, accentSurface);
+            likedTab = button(R.string.discover_liked, accent, surface);
+            uploadsTab = button(R.string.discover_uploads, accent, surface);
+            uploadsTab.setVisibility(BuildConfig.PRIVATE_UPLOADS_ENABLED ? View.VISIBLE : View.GONE);
+            for (Button tab : new Button[]{browseTab, likedTab, uploadsTab}) {
+                tab.setPaddingRelative(dp(4), 0, dp(4), 0);
+            }
+            browseTab.setOnClickListener(view -> selectView(Section.BROWSE));
+            likedTab.setOnClickListener(view -> selectView(Section.LIKED));
+            uploadsTab.setOnClickListener(view -> selectView(Section.UPLOADS));
+            tabs.addView(browseTab, new LinearLayout.LayoutParams(0, dp(48), 1));
+            LinearLayout.LayoutParams likedSize = new LinearLayout.LayoutParams(0, dp(48), 1);
+            likedSize.setMarginStart(dp(8));
+            tabs.addView(likedTab, likedSize);
+            LinearLayout.LayoutParams uploadsSize = new LinearLayout.LayoutParams(0, dp(48), 1);
+            uploadsSize.setMarginStart(dp(8));
+            tabs.addView(uploadsTab, uploadsSize);
+            addWithMargin(this, tabs, MATCH_PARENT, WRAP_CONTENT, 8);
+
+            search = new EditText(MainActivity.this);
+            search.setSingleLine(true);
+            search.setHint(R.string.discover_search);
+            search.setTextColor(ink);
+            search.setHintTextColor(muted);
+            search.setTextSize(15);
+            search.setPaddingRelative(dp(14), 0, dp(14), 0);
+            search.setBackground(round(surface, 14));
+            search.setInputType(InputType.TYPE_CLASS_TEXT);
+            search.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+            search.setOnEditorActionListener((view, action, event) -> {
+                if (action == EditorInfo.IME_ACTION_SEARCH) {
+                    hideKeyboard();
+                    return true;
+                }
+                return false;
+            });
+            search.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence value, int start, int count, int after) {}
+                @Override public void onTextChanged(CharSequence value, int start, int before, int count) {
+                    render();
+                    list.setSelection(0);
+                }
+                @Override public void afterTextChanged(Editable value) {}
+            });
+            addWithMargin(this, search, MATCH_PARENT, dp(48), 10);
+
+            catalogRetry = button(R.string.discover_refresh_failed, accent, accentSurface);
+            catalogRetry.setOnClickListener(view -> loadCatalog(true));
+            addWithMargin(this, catalogRetry, MATCH_PARENT, dp(48), 8);
+
+            uploadStatus = text(R.string.upload_preparing, 14, muted, false);
+            uploadStatus.setVisibility(View.GONE);
+            addWithMargin(this, uploadStatus, MATCH_PARENT, WRAP_CONTENT, 8);
+            uploadProgress = new ProgressBar(MainActivity.this, null, android.R.attr.progressBarStyleHorizontal);
+            uploadProgress.setMax(100);
+            uploadProgress.setProgressTintList(ColorStateList.valueOf(accent));
+            uploadProgress.setVisibility(View.GONE);
+            addWithMargin(this, uploadProgress, MATCH_PARENT, dp(4), 4);
+
+            quickPicksHeader = row();
+            TextView quickPicksTitle = text(R.string.discover_quick_picks, 24, ink, true);
+            markHeading(quickPicksTitle);
+            quickPicksHeader.addView(quickPicksTitle, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+            Button viewAll = button(R.string.discover_view_all, accent, accentSurface);
+            viewAll.setOnClickListener(view -> selectView(Section.ALL));
+            LinearLayout.LayoutParams viewAllSize = new LinearLayout.LayoutParams(WRAP_CONTENT, dp(48));
+            viewAllSize.setMarginStart(dp(8));
+            quickPicksHeader.addView(viewAll, viewAllSize);
+            addWithMargin(this, quickPicksHeader, MATCH_PARENT, WRAP_CONTENT, 10);
+
+            FrameLayout results = new FrameLayout(MainActivity.this);
+            LinearLayout.LayoutParams resultsSize = new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1);
+            resultsSize.topMargin = dp(8);
+            addView(results, resultsSize);
+            list = styledList();
+            list.setAdapter(trackAdapter);
+            list.setOnItemClickListener((parent, view, position, id) ->
+                    selectTrack(visible, visible.get(position), null));
+            list.setOnItemLongClickListener((parent, view, position, id) -> {
+                Track track = visible.get(position);
+                if (!track.isPrivateOnline()) {
+                    return false;
+                }
+                confirmDeleteUpload(track);
+                return true;
+            });
+            results.addView(list, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+
+            quickPickColumns = row();
+            quickPickColumns.setGravity(Gravity.TOP);
+            HorizontalScrollView carousel = new HorizontalScrollView(MainActivity.this) {
+                @Override protected void onMeasure(int widthSpec, int heightSpec) {
+                    int viewport = View.MeasureSpec.getSize(widthSpec);
+                    int count = quickPickColumns.getChildCount();
+                    int columnWidth = count > 1 ? viewport * 5 / 6 : viewport;
+                    for (int index = 0; index < count; index++) {
+                        quickPickColumns.getChildAt(index).getLayoutParams().width = columnWidth;
+                    }
+                    super.onMeasure(widthSpec, heightSpec);
+                }
+            };
+            carousel.setHorizontalScrollBarEnabled(false);
+            carousel.addView(quickPickColumns, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT));
+            LinearLayout browseContent = column();
+            browseContent.addView(carousel, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            albumsSection = column();
+            TextView albumsTitle = text(R.string.discover_albums, 24, ink, true);
+            markHeading(albumsTitle);
+            albumsSection.addView(albumsTitle);
+            albumCards = row();
+            albumCards.setGravity(Gravity.TOP);
+            HorizontalScrollView albumScroller = new HorizontalScrollView(MainActivity.this);
+            albumScroller.setHorizontalScrollBarEnabled(false);
+            albumScroller.addView(albumCards, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT));
+            addWithMargin(albumsSection, albumScroller, MATCH_PARENT, WRAP_CONTENT, 12);
+            addWithMargin(browseContent, albumsSection, MATCH_PARENT, WRAP_CONTENT, 20);
+            browseResults = new ScrollView(MainActivity.this);
+            browseResults.setPadding(0, 0, 0, dp(8));
+            browseResults.addView(browseContent, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            results.addView(browseResults, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+
+            LinearLayout empty = column();
+            empty.setGravity(Gravity.CENTER);
+            status = text(0, 15, muted, false);
+            status.setGravity(Gravity.CENTER);
+            empty.addView(status, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            statusAction = button(R.string.retry, accent, accentSurface);
+            addWithMargin(empty, statusAction, WRAP_CONTENT, dp(48), 10);
+            results.addView(empty, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER));
+        }
+
+        void open() {
+            if (section != Section.UPLOADS) {
+                loadCatalog(false);
+            }
+            refreshAccount();
+            render();
+        }
+
+        private boolean goBack() {
+            if (section != Section.ALL && section != Section.ALBUM) {
+                return false;
+            }
+            selectView(Section.BROWSE);
+            return true;
+        }
+
+        private void selectView(Section next) {
+            if (section != next) {
+                hideKeyboard();
+                boolean clearAlbumSearch = section == Section.ALBUM && next == Section.BROWSE;
+                section = next;
+                if (next != Section.ALBUM) {
+                    selectedAlbum = null;
+                }
+                if (clearAlbumSearch && search.length() > 0) {
+                    search.setText("");
+                }
+                if (section == Section.UPLOADS) {
+                    cancelCatalogRefresh();
+                    loadUploads();
+                } else {
+                    loadCatalog(false);
+                }
+                render();
+                list.setSelection(0);
+            }
+        }
+
+        private void loadCatalog(boolean forceRefresh) {
+            if (!DiscoverBackend.configured() || catalogState == Load.LOADING) {
+                return;
+            }
+            if (!forceRefresh && catalog != null && catalog.fresh()) {
+                scheduleCatalogRefresh();
+                return;
+            }
+            cancelCatalogRefresh();
+            catalogState = Load.LOADING;
+            render();
+            backend.catalog(forceRefresh, saved -> {
+                if (!isDestroyed()) {
+                    catalog = saved;
+                    render();
+                }
+            }, result -> {
+                if (isDestroyed()) {
+                    return;
+                }
+                catalogState = result.success() ? Load.READY : Load.ERROR;
+                if (result.success()) {
+                    catalog = result.value();
+                }
+                scheduleCatalogRefresh();
+                render();
+            });
+        }
+
+        private void scheduleCatalogRefresh() {
+            cancelCatalogRefresh();
+            if (resumed && screen == Screen.DISCOVER && section != Section.UPLOADS && catalog != null) {
+                if (catalogState == Load.READY) {
+                    handler.postDelayed(refreshStaleCatalog, catalog.millisUntilStale());
+                } else if (catalogState == Load.ERROR && catalog.usable()) {
+                    handler.postDelayed(refreshStaleCatalog, catalog.millisUntilExpiry());
+                }
+            }
+        }
+
+        private void cancelCatalogRefresh() {
+            handler.removeCallbacks(refreshStaleCatalog);
+        }
+
+        void refreshAccount() {
+            if (!DiscoverBackend.signInConfigured() || accountBusy) {
+                render();
+                return;
+            }
+            accountBusy = true;
+            accountError = 0;
+            render();
+            backend.account(this::finishAccount);
+        }
+
+        void toggleAccount() {
+            if (accountBusy || uploading || !DiscoverBackend.signInConfigured()) {
+                return;
+            }
+            if (account == null) {
+                signIn();
+                return;
+            }
+            accountBusy = true;
+            changeAccount(null);
+            render();
+            backend.signOut(result -> {
+                if (isDestroyed()) {
+                    return;
+                }
+                GoogleSignIn.clear(MainActivity.this, handler::post);
+                accountBusy = false;
+                accountError = result.success() ? 0 : R.string.account_error;
+                render();
+            });
+        }
+
+        private void signIn() {
+            if (accountBusy || !DiscoverBackend.signInConfigured()) {
+                return;
+            }
+            hideKeyboard();
+            accountBusy = true;
+            accountError = 0;
+            render();
+            signInRequest = new CancellationSignal();
+            try {
+                GoogleSignIn.request(MainActivity.this, signInRequest, handler::post, result -> {
+                    signInRequest = null;
+                    if (isDestroyed()) {
+                        return;
+                    }
+                    GoogleSignIn.Token token = result.token();
+                    if (token != null) {
+                        backend.signIn(token.idToken(), token.nonce(), this::finishAccount);
+                    } else {
+                        accountBusy = false;
+                        accountError = result.cancelled() ? 0
+                                : result.noCredential() ? R.string.google_account_needed : R.string.account_error;
+                        render();
+                    }
+                });
+            } catch (RuntimeException error) {
+                signInRequest = null;
+                accountBusy = false;
+                accountError = R.string.account_error;
+                render();
+            }
+        }
+
+        void cancelSignIn() {
+            if (signInRequest != null) {
+                signInRequest.cancel();
+            }
+        }
+
+        private void finishAccount(DiscoverBackend.Result<DiscoverBackend.Account> result) {
+            if (isDestroyed()) {
+                return;
+            }
+            accountBusy = false;
+            accountError = result.success() ? 0 : R.string.account_error;
+            if (result.success()) {
+                changeAccount(result.value());
+                loadLikes();
+                if (section == Section.UPLOADS) {
+                    loadUploads();
+                }
+            }
+            render();
+        }
+
+        private void changeAccount(DiscoverBackend.Account next) {
+            String currentId = account == null ? null : account.id();
+            String nextId = next == null ? null : next.id();
+            if (!Objects.equals(currentId, nextId)) {
+                if (currentId != null) {
+                    withPlayback(PlaybackService::clearPrivatePlayback);
+                }
+                accountGeneration++;
+                likes = Collections.emptySet();
+                uploads = Collections.emptyList();
+                pendingLikes.clear();
+                likesState = Load.IDLE;
+                uploadsState = Load.IDLE;
+            }
+            account = next;
+        }
+
+        private void loadUploads() {
+            if (account == null || uploadsState == Load.LOADING) {
+                return;
+            }
+            uploadsState = Load.LOADING;
+            int generation = accountGeneration;
+            backend.privateTracks(account.id(), result -> {
+                if (isDestroyed() || generation != accountGeneration) {
+                    return;
+                }
+                uploadsState = result.success() ? Load.READY : Load.ERROR;
+                if (result.success()) {
+                    uploads = result.value();
+                }
+                render();
+            });
+        }
+
+        private void pickUpload() {
+            if (account == null || uploading || pendingUploadOwner != null) {
+                return;
+            }
+            hideKeyboard();
+            Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("audio/*")
+                    .putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"audio/mpeg", "audio/mp4", "audio/x-m4a"});
+            try {
+                pendingUploadOwner = account.id();
+                startActivityForResult(picker, PICK_PRIVATE_MUSIC);
+            } catch (ActivityNotFoundException error) {
+                pendingUploadOwner = null;
+                Toast.makeText(MainActivity.this, R.string.picker_error, Toast.LENGTH_SHORT).show();
+            }
+        }
+
+        void upload(Uri document, String owner) {
+            if (uploading || account != null && !account.id().equals(owner)) {
+                return;
+            }
+            section = Section.UPLOADS;
+            uploading = true;
+            uploadedPercent = -1;
+            render();
+            PrivateMusicTransfer.upload(MainActivity.this, document, owner, percent -> {
+                if (!isDestroyed()) {
+                    uploadedPercent = percent;
+                    renderUploadProgress();
+                }
+            }, code -> {
+                if (isDestroyed()) {
+                    return;
+                }
+                uploading = false;
+                if (code == null) {
+                    Toast.makeText(MainActivity.this, R.string.upload_complete, Toast.LENGTH_SHORT).show();
+                } else {
+                    int message = switch (code) {
+                        case "invalid_size" -> R.string.upload_size_error;
+                        case "invalid_type", "invalid_audio" -> R.string.upload_type_error;
+                        case "quota_exceeded" -> R.string.upload_quota_error;
+                        case "too_many_uploads" -> R.string.upload_pending_error;
+                        case "storage_not_configured" -> R.string.upload_setup_needed;
+                        default -> R.string.upload_error;
+                    };
+                    Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                }
+                if (account != null && account.id().equals(owner)) {
+                    loadUploads();
+                }
+                render();
+            });
+        }
+
+        private void confirmDeleteUpload(Track track) {
+            if (account == null) {
+                return;
+            }
+            String owner = account.id();
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(R.string.delete_upload));
+            dialog.addMessage(getString(R.string.delete_upload_message, track.displayTitle(MainActivity.this)));
+            dialog.addCancel();
+            dialog.addAction(R.string.delete_upload, true, () -> {
+                dialog.dismiss();
+                backend.deletePrivateTrack(owner, track.onlineId(), result -> {
+                    if (isDestroyed() || account == null || !account.id().equals(owner)) {
+                        return;
+                    }
+                    if (result.success()) {
+                        withPlayback(service -> service.removeTrack(track.libraryUri().toString()));
+                    } else {
+                        Toast.makeText(MainActivity.this, R.string.delete_upload_error, Toast.LENGTH_LONG).show();
+                    }
+                    loadUploads();
+                });
+            });
+            dialog.show();
+        }
+
+        private void renderUploadProgress() {
+            boolean visible = section == Section.UPLOADS && uploading;
+            uploadStatus.setVisibility(visible ? View.VISIBLE : View.GONE);
+            uploadProgress.setVisibility(visible ? View.VISIBLE : View.GONE);
+            if (!visible) {
+                return;
+            }
+            uploadProgress.setIndeterminate(uploadedPercent < 0 || uploadedPercent == 100);
+            uploadProgress.setProgress(Math.max(0, uploadedPercent));
+            if (uploadedPercent < 0) {
+                uploadStatus.setText(R.string.upload_preparing);
+            } else if (uploadedPercent == 100) {
+                uploadStatus.setText(R.string.upload_verifying);
+            } else {
+                uploadStatus.setText(getString(R.string.upload_percent, uploadedPercent));
+            }
+        }
+
+        private void loadLikes() {
+            if (account == null || likesState == Load.LOADING) {
+                return;
+            }
+            likesState = Load.LOADING;
+            int generation = accountGeneration;
+            backend.likes(account.id(), result -> {
+                if (isDestroyed() || generation != accountGeneration) {
+                    return;
+                }
+                likesState = result.success() ? Load.READY : Load.ERROR;
+                if (result.success()) {
+                    likes = result.value();
+                }
+                render();
+            });
+        }
+
+        boolean canLike() {
+            return account != null;
+        }
+
+        void toggleLike(Track track) {
+            String id = track.onlineId();
+            if (!canLike() || accountBusy || likesState != Load.READY || !pendingLikes.add(id)) {
+                return;
+            }
+            boolean liked = !likes.contains(id);
+            int generation = accountGeneration;
+            render();
+            backend.setLiked(account.id(), id, liked, result -> {
+                if (isDestroyed() || generation != accountGeneration) {
+                    return;
+                }
+                pendingLikes.remove(id);
+                if (result.success()) {
+                    if (liked) {
+                        likes.add(id);
+                    } else {
+                        likes.remove(id);
+                    }
+                } else {
+                    Toast.makeText(MainActivity.this, R.string.discover_likes_error, Toast.LENGTH_SHORT).show();
+                    refreshAccount();
+                }
+                render();
+            });
+        }
+
+        void bindLikeButton(ImageButton button, Track track) {
+            boolean liked = likes.contains(track.onlineId());
+            button.setImageResource(liked ? R.drawable.ic_liked : R.drawable.ic_like);
+            button.setContentDescription(getString(liked ? R.string.unlike_track : R.string.like_track,
+                    track.displayTitle(MainActivity.this)));
+            MainActivity.setEnabled(button, canLike() && !accountBusy && likesState == Load.READY
+                    && !pendingLikes.contains(track.onlineId()));
+        }
+
+        private void bindRowLike(TrackRow row, Track track) {
+            if (row.likeButton == null && canLike()) {
+                row.likeButton = iconButton(R.drawable.ic_like, R.string.discover_liked, accent, Color.TRANSPARENT,
+                        48, 24, () -> {});
+                row.likeButton.setFocusable(false);
+                row.addView(row.likeButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
+            }
+            if (row.likeButton != null) {
+                row.likeButton.setVisibility(canLike() ? View.VISIBLE : View.GONE);
+                row.likeButton.setOnClickListener(view -> toggleLike(track));
+                bindLikeButton(row.likeButton, track);
+            }
+        }
+
+        private void renderQuickPicks(List<Track> tracks) {
+            List<Track> picks = tracks.subList(0, Math.min(tracks.size(), QUICK_PICK_LIMIT));
+            if (!quickPickTracks.equals(picks)) {
+                quickPickTracks = new ArrayList<>(picks);
+                quickPickRows.clear();
+                quickPickColumns.removeAllViews();
+                for (int start = 0; start < picks.size(); start += QUICK_PICK_ROWS_PER_COLUMN) {
+                    LinearLayout column = column();
+                    LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
+                    if (start > 0) {
+                        size.setMarginStart(dp(10));
+                    }
+                    quickPickColumns.addView(column, size);
+                    int end = Math.min(start + QUICK_PICK_ROWS_PER_COLUMN, picks.size());
+                    for (Track track : picks.subList(start, end)) {
+                        TrackRow row = new TrackRow();
+                        row.duration.setVisibility(View.GONE);
+                        row.setFocusable(true);
+                        row.setOnClickListener(view -> selectTrack(visible, track, null));
+                        quickPickRows.add(row);
+                        column.addView(row, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+                    }
+                }
+            }
+            bindQuickPickRows();
+        }
+
+        private void bindQuickPickRows() {
+            for (int index = 0; index < quickPickRows.size(); index++) {
+                TrackRow row = quickPickRows.get(index);
+                Track track = quickPickTracks.get(index);
+                row.bind(track);
+                bindRowLike(row, track);
+            }
+        }
+
+        private void renderAlbums(List<Track> tracks) {
+            Map<AlbumKey, Track> covers = new LinkedHashMap<>();
+            for (Track track : tracks) {
+                if (track.album().isEmpty()) {
+                    continue;
+                }
+                AlbumKey album = AlbumKey.of(track);
+                Track existingCover = covers.putIfAbsent(album, track);
+                if (existingCover != null && existingCover.artworkUri() == null && track.artworkUri() != null) {
+                    covers.put(album, track);
+                }
+            }
+            albumsSection.setVisibility(covers.isEmpty() ? View.GONE : View.VISIBLE);
+            if (albumCovers.equals(covers)) {
+                return;
+            }
+            albumCovers = covers;
+            albumCards.removeAllViews();
+            for (Map.Entry<AlbumKey, Track> entry : covers.entrySet()) {
+                AlbumKey album = entry.getKey();
+                Track cover = entry.getValue();
+                LinearLayout card = column();
+                card.setBackground(ripple(Color.TRANSPARENT, 12));
+                card.setFocusable(true);
+                card.setOnClickListener(view -> {
+                    selectedAlbum = album;
+                    selectView(Section.ALBUM);
+                });
+                LinearLayout.LayoutParams cardSize = new LinearLayout.LayoutParams(dp(116), WRAP_CONTENT);
+                cardSize.setMarginEnd(dp(12));
+                albumCards.addView(card, cardSize);
+
+                ImageView tile = artworkTile(accentSurface, 12);
+                displayArtwork(tile, null, R.drawable.ic_record, null, 14);
+                card.addView(tile, new LinearLayout.LayoutParams(MATCH_PARENT, dp(116)));
+                if (cover.artworkUri() != null) {
+                    ArtworkLoader.load(MainActivity.this, cover, ArtworkLoader.THUMBNAIL_SIZE, bitmap -> {
+                        if (!isDestroyed() && bitmap != null) {
+                            displayArtwork(tile, bitmap, R.drawable.ic_record, null, 14);
+                        }
+                    });
+                }
+
+                TextView title = singleLineText(15, ink, true);
+                title.setText(album.name());
+                addWithMargin(card, title, MATCH_PARENT, WRAP_CONTENT, 8);
+                if (!album.artist().isEmpty()) {
+                    TextView artist = singleLineText(13, muted, false);
+                    artist.setText(album.artist());
+                    addWithMargin(card, artist, MATCH_PARENT, WRAP_CONTENT, 4);
+                }
+            }
+        }
+
+        private void render() {
+            renderAccount();
+            boolean showingAll = section == Section.ALL;
+            boolean showingAlbum = section == Section.ALBUM;
+            boolean showingLikes = section == Section.LIKED;
+            boolean showingUploads = section == Section.UPLOADS;
+            boolean hasCatalog = catalog != null && catalog.usable();
+            headerTitle.setText(showingAlbum ? selectedAlbum.name()
+                    : getText(showingAll ? R.string.discover_all_tracks : R.string.discover));
+            browseBack.setVisibility(showingAll || showingAlbum ? View.VISIBLE : View.GONE);
+            refreshCatalog.setVisibility(DiscoverBackend.configured() && !showingLikes && !showingUploads
+                    ? View.VISIBLE : View.GONE);
+            MainActivity.setEnabled(refreshCatalog, catalogState != Load.LOADING);
+            styleTab(browseTab, !showingLikes && !showingUploads);
+            styleTab(likedTab, showingLikes);
+            styleTab(uploadsTab, showingUploads);
+            uploadButton.setVisibility(showingUploads && account != null ? View.VISIBLE : View.GONE);
+            MainActivity.setEnabled(uploadButton, !uploading && !accountBusy);
+            renderUploadProgress();
+
+            int message = 0;
+            int action = 0;
+            Runnable next = null;
+            if (!DiscoverBackend.configured()) {
+                message = R.string.discover_setup_needed;
+            } else if ((showingLikes || showingUploads) && account == null) {
+                if (accountBusy) {
+                    message = R.string.loading;
+                } else {
+                    message = accountError != 0 ? accountError
+                            : showingUploads ? R.string.upload_sign_in : R.string.discover_sign_in_prompt;
+                    if (DiscoverBackend.signInConfigured()) {
+                        action = R.string.google_sign_in;
+                        next = this::signIn;
+                    }
+                }
+            } else if (showingUploads && uploadsState == Load.ERROR) {
+                message = R.string.upload_list_error;
+                action = R.string.retry;
+                next = this::refreshAccount;
+            } else if (showingUploads && uploadsState != Load.READY && uploads.isEmpty()) {
+                message = R.string.loading;
+            } else if (showingLikes && likesState == Load.ERROR) {
+                message = R.string.discover_likes_error;
+                action = R.string.retry;
+                next = this::refreshAccount;
+            } else if (!showingUploads && catalogState == Load.ERROR && !hasCatalog) {
+                message = R.string.discover_catalog_error;
+                action = R.string.retry;
+                next = () -> loadCatalog(true);
+            } else if ((!showingUploads && !hasCatalog)
+                    || (showingLikes && likesState != Load.READY && likes.isEmpty())) {
+                message = R.string.loading;
+            }
+
+            boolean searchable = message == 0;
+            search.setVisibility(searchable ? View.VISIBLE : View.GONE);
+            search.setHint(showingAlbum ? R.string.discover_search_album : R.string.discover_search);
+            catalogRetry.setVisibility(searchable && !showingUploads && hasCatalog && catalogState == Load.ERROR
+                    ? View.VISIBLE : View.GONE);
+            String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
+            boolean showingQuickPicks = section == Section.BROWSE && searchable && query.isEmpty();
+            List<Track> matches = new ArrayList<>();
+            if (searchable) {
+                boolean hasTracks = false;
+                for (Track track : showingUploads ? uploads : catalog.tracks()) {
+                    if (showingAlbum && !selectedAlbum.equals(AlbumKey.of(track))) {
+                        continue;
+                    }
+                    if (!showingLikes || likes.contains(track.onlineId())) {
+                        hasTracks = true;
+                        if (track.title().toLowerCase(Locale.ROOT).contains(query)
+                                || track.artist().toLowerCase(Locale.ROOT).contains(query)) {
+                            matches.add(track);
+                        }
+                    }
+                }
+                if (matches.isEmpty()) {
+                    message = hasTracks ? R.string.no_matches_title : showingUploads ? R.string.upload_empty
+                            : showingLikes ? R.string.discover_no_likes : showingAlbum
+                            ? R.string.discover_empty_album : R.string.discover_no_tracks;
+                }
+            }
+            visible = matches;
+            quickPicksHeader.setVisibility(showingQuickPicks ? View.VISIBLE : View.GONE);
+            browseResults.setVisibility(showingQuickPicks && !matches.isEmpty() ? View.VISIBLE : View.GONE);
+            if (showingQuickPicks) {
+                renderQuickPicks(matches);
+                renderAlbums(matches);
+            }
+            trackAdapter.notifyDataSetChanged();
+            list.setVisibility(!showingQuickPicks && !matches.isEmpty() ? View.VISIBLE : View.GONE);
+            status.setVisibility(message == 0 ? View.GONE : View.VISIBLE);
+            if (message != 0) {
+                status.setText(message);
+            }
+            statusAction.setVisibility(action == 0 ? View.GONE : View.VISIBLE);
+            if (next != null) {
+                statusAction.setText(action);
+                Runnable selected = next;
+                statusAction.setOnClickListener(view -> selected.run());
+            }
+        }
+
+        private void styleTab(Button button, boolean selected) {
+            button.setSelected(selected);
+            button.setBackground(ripple(selected ? accentSurface : surface, 14));
+        }
+
+        private void renderAccount() {
+            if (accountBusy) {
+                accountStatus.setText(R.string.loading);
+            } else if (!DiscoverBackend.signInConfigured()) {
+                accountStatus.setText(R.string.account_setup_needed);
+            } else if (accountError != 0) {
+                accountStatus.setText(accountError);
+            } else if (account == null) {
+                accountStatus.setText(R.string.account_signed_out);
+            } else {
+                accountStatus.setText(account.email().isEmpty() ? getString(R.string.account_signed_in) : account.email());
+            }
+            accountAction.setText(account == null ? R.string.google_sign_in : R.string.sign_out);
+            accountAction.setVisibility(DiscoverBackend.signInConfigured() ? View.VISIBLE : View.GONE);
+            MainActivity.setEnabled(accountAction, !accountBusy && !uploading);
+            renderPlayerArtworkAction(playback == null ? null : playback.currentTrack());
+        }
+    }
+
+    private final class RecentlyDeletedPage extends LinearLayout {
+        private final ListView list;
+        private final TextView empty;
+        private final DateFormat dates = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, appLocale);
+        private List<RecentlyDeleted.Entry> entries = Collections.emptyList();
+        private final BaseAdapter historyAdapter = new BaseAdapter() {
+            @Override public int getCount() { return entries.size(); }
+            @Override public RecentlyDeleted.Entry getItem(int position) { return entries.get(position); }
+            @Override public long getItemId(int position) { return position; }
+
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                RemovedTrackRow row = recycled == null ? new RemovedTrackRow() : (RemovedTrackRow) recycled;
+                row.bind(getItem(position));
+                return row;
+            }
+        };
+
+        RecentlyDeletedPage() {
+            super(MainActivity.this);
+            setOrientation(VERTICAL);
+            setPadding(dp(20), dp(6), dp(20), dp(10));
+
+            TextView title = singleLineText(16, ink, true);
+            title.setText(R.string.recently_deleted);
+            FrameLayout header = screenHeader(title);
+            ImageButton back = iconButton(R.drawable.ic_back, R.string.back_to_settings, accent, accentSurface,
+                    48, 24, () -> showScreen(Screen.SETTINGS));
+            addHeaderButton(header, back, Gravity.START);
+            addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, dp(54)));
+
+            FrameLayout results = new FrameLayout(MainActivity.this);
+            addView(results, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+            list = styledList();
+            list.setAdapter(historyAdapter);
+            results.addView(list, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+            empty = text(R.string.no_recently_deleted, 15, muted, false);
+            empty.setGravity(Gravity.CENTER);
+            results.addView(empty, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER));
+        }
+
+        void refresh() {
+            entries = RecentlyDeleted.load(MainActivity.this);
+            historyAdapter.notifyDataSetChanged();
+            list.setVisibility(entries.isEmpty() ? View.GONE : View.VISIBLE);
+            empty.setVisibility(entries.isEmpty() ? View.VISIBLE : View.GONE);
+        }
+
+        private final class RemovedTrackRow extends LinearLayout {
+            private final TextView title;
+            private final TextView source;
+            private final TextView date;
+
+            RemovedTrackRow() {
+                super(MainActivity.this);
+                setOrientation(VERTICAL);
+                setPadding(dp(8), dp(10), dp(8), dp(10));
+                title = singleLineText(16, ink, true);
+                source = singleLineText(13, muted, false);
+                date = text(0, 13, muted, false);
+                addView(title);
+                addWithMargin(this, source, MATCH_PARENT, WRAP_CONTENT, 3);
+                addWithMargin(this, date, MATCH_PARENT, WRAP_CONTENT, 2);
+            }
+
+            void bind(RecentlyDeleted.Entry entry) {
+                title.setText(entry.title().isEmpty() ? getString(R.string.untitled_track) : entry.title());
+                source.setText(entry.playlistName() == null ? getString(R.string.removed_from_masheeds)
+                        : getString(R.string.removed_from_named_playlist, entry.playlistName()));
+                date.setText(dates.format(new Date(entry.removedAt())));
+            }
+        }
     }
 
     private final class PlaylistPage extends LinearLayout {
@@ -1651,15 +2677,17 @@ public final class MainActivity extends Activity {
             dialog.addChecklist(labels, checked);
             dialog.addCancel();
             dialog.addAction(R.string.save, true, () -> {
+                List<Track> removed = new ArrayList<>();
                 for (int index = 0; index < available.size(); index++) {
                     String uri = available.get(index).libraryUri().toString();
                     if (checked[index]) {
                         members.add(uri);
-                    } else {
-                        members.remove(uri);
+                    } else if (members.remove(uri)) {
+                        removed.add(available.get(index));
                     }
                 }
                 replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), new ArrayList<>(members)));
+                RecentlyDeleted.record(MainActivity.this, removed, playlist.name());
                 dialog.dismiss();
             });
             dialog.show();
@@ -1672,8 +2700,10 @@ public final class MainActivity extends Activity {
             dialog.addCancel();
             dialog.addAction(R.string.remove, true, () -> {
                 List<String> members = new ArrayList<>(playlist.tracks());
-                members.removeIf(track.libraryUri().toString()::equals);
-                replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), members));
+                if (members.removeIf(track.libraryUri().toString()::equals)) {
+                    replacePlaylist(playlist, new Playlist(playlist.id(), playlist.name(), members));
+                    RecentlyDeleted.record(MainActivity.this, Collections.singletonList(track), playlist.name());
+                }
                 dialog.dismiss();
             });
             dialog.show();
@@ -1725,6 +2755,7 @@ public final class MainActivity extends Activity {
             dialog.addAction(R.string.delete_playlist, true, () -> {
                 playlists.remove(playlist);
                 savePlaylists();
+                RecentlyDeleted.record(MainActivity.this, resolveTracks(playlist), playlist.name());
                 updateCover(CustomArtwork.playlistKey(playlist.id()), null);
                 withPlayback(service -> service.detachPlaylist(playlist.id()));
                 dialog.dismiss();
@@ -1827,6 +2858,7 @@ public final class MainActivity extends Activity {
         private final TextView artist;
         private final TextView duration;
         private ImageButton handle;
+        private ImageButton likeButton;
         private Track artworkTrack;
         private Bitmap artwork;
         private Future<?> artworkRequest;
@@ -1855,7 +2887,7 @@ public final class MainActivity extends Activity {
         }
 
         void bind(Track track) {
-            boolean selected = track.uri().equals(selectedTrack);
+            boolean selected = track.libraryUri().equals(selectedTrack);
             setBackground(ripple(selected ? accentSurface : Color.TRANSPARENT, 14));
             setSelected(selected);
             long revision = CustomArtwork.revision();
@@ -1870,7 +2902,7 @@ public final class MainActivity extends Activity {
                 artworkRequest = ArtworkLoader.load(MainActivity.this, track, ArtworkLoader.THUMBNAIL_SIZE, bitmap -> {
                     if (version == artworkVersion && !isDestroyed()) {
                         artwork = bitmap;
-                        renderArtwork(track.uri().equals(selectedTrack));
+                        renderArtwork(track.libraryUri().equals(selectedTrack));
                     }
                 });
             }
