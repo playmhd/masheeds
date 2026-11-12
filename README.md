@@ -9,7 +9,8 @@ Download the APK from [GitHub Releases](https://github.com/playmhd/masheeds/rele
 ## Listen
 
 - **Library** lets you play audio stored on your device offline. Tap **+** to add files, or go to **Settings → Library → Scan device** to find audio on your device.
-- **Discover** lets you stream as a guest. Browse **Quick picks** and **Albums**, search for a track, or tap **View all** for the full list. Sign in with Google in **Settings → Account** to save and sync your **Liked tracks**.
+- **Discover** lets you stream as a guest. Browse **Quick picks** and **Albums**, search for a track, or tap **View all** for the full list.
+- **Profile** shows your Google account and the tracks you’ve published in Discover. Sign in there to sync **Liked tracks** and submit an MP3 for review. To sign out, go to **Settings → Account**.
 - **Now playing** opens when you tap the mini player. Use shuffle, repeat, or the sleep timer, and control playback from Android’s media controls.
 
 ## Make it yours

@@ -13,7 +13,12 @@ import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.database.ContentObserver;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -29,6 +34,7 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.Editable;
+import android.text.InputFilter;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
@@ -61,6 +67,7 @@ import android.window.OnBackInvokedDispatcher;
 import com.masheeds.player.TrackLibrary.Track;
 import com.masheeds.player.PlaylistStore.Playlist;
 
+import java.io.IOException;
 import java.text.DateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -91,10 +98,12 @@ public final class MainActivity extends Activity {
     private static final int THUMBNAIL_DP = 48;
     private static final int PICK_FILES = 1;
     private static final int PICK_PRIVATE_MUSIC = 40;
+    private static final int PICK_DISCOVER_SUBMISSION = 41;
     private static final int AUDIO_ACCESS = 2;
     private static final int PICK_COVER = 3;
 
-    private enum Screen { LIBRARY, PLAYLISTS, DISCOVER, SETTINGS, RECENTLY_DELETED, PLAYER }
+    private enum Screen { LIBRARY, PLAYLISTS, DISCOVER, PROFILE, SETTINGS, RECENTLY_DELETED, PLAYER }
+    private enum Load { IDLE, LOADING, READY, ERROR }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService scanner = Executors.newSingleThreadExecutor();
@@ -204,6 +213,7 @@ public final class MainActivity extends Activity {
     private BaseAdapter timerChoices;
     private DiscoverPage discoverScreen;
     private ScrollView settingsScreen;
+    private ProfilePage profileScreen;
     private RecentlyDeletedPage recentlyDeletedPage;
     private TextView audioAccessSummary;
     private TextView accountStatus;
@@ -257,6 +267,7 @@ public final class MainActivity extends Activity {
         if (state != null) {
             pendingCoverKey = state.getString("pendingCover");
             pendingUploadOwner = state.getString("pendingUploadOwner");
+            profileScreen.restoreSubmissionPicker(state);
             search.setText(state.getString("query", ""));
             String albumName = state.getString("discoverAlbum");
             if (albumName != null) {
@@ -323,7 +334,7 @@ public final class MainActivity extends Activity {
         renderAudioAccess();
         if (screen == Screen.DISCOVER) {
             discoverScreen.open();
-        } else if (screen == Screen.SETTINGS) {
+        } else if (screen == Screen.SETTINGS || screen == Screen.PROFILE) {
             discoverScreen.refreshAccount();
         }
         if (screen == Screen.RECENTLY_DELETED) {
@@ -368,6 +379,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onDestroy() {
         discoverScreen.cancelSignIn();
+        profileScreen.cancelAvatarRequest();
         handler.removeCallbacksAndMessages(null);
         scanner.shutdownNow();
         super.onDestroy();
@@ -376,6 +388,7 @@ public final class MainActivity extends Activity {
     @Override public void onSaveInstanceState(Bundle state) {
         state.putString("pendingCover", pendingCoverKey);
         state.putString("pendingUploadOwner", pendingUploadOwner);
+        profileScreen.saveSubmissionPicker(state);
         state.putString("query", search.getText().toString());
         state.putBoolean("discoverAllTracks", discoverScreen.section == DiscoverPage.Section.ALL);
         if (discoverScreen.selectedAlbum != null) {
@@ -408,11 +421,13 @@ public final class MainActivity extends Activity {
         playlistPage = new PlaylistPage();
         discoverScreen = new DiscoverPage();
         settingsScreen = buildSettingsScreen();
+        profileScreen = new ProfilePage();
         recentlyDeletedPage = new RecentlyDeletedPage();
         pages.addView(library, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(playlistPage, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(discoverScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(settingsScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        pages.addView(profileScreen, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         pages.addView(recentlyDeletedPage, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
 
         miniPlayer = buildMiniPlayer();
@@ -427,6 +442,7 @@ public final class MainActivity extends Activity {
         addNavigationButton(Screen.LIBRARY, R.string.library_settings, R.drawable.ic_tracks);
         addNavigationButton(Screen.PLAYLISTS, R.string.playlists, R.drawable.ic_playlists);
         addNavigationButton(Screen.DISCOVER, R.string.discover, R.drawable.ic_discover);
+        addNavigationButton(Screen.PROFILE, R.string.profile, R.drawable.ic_profile);
         addNavigationButton(Screen.SETTINGS, R.string.settings, R.drawable.ic_settings);
         shell.addView(bottomNavigation, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
         return shell;
@@ -437,7 +453,7 @@ public final class MainActivity extends Activity {
         navigation.setCompoundDrawablesRelative(null, smallIcon(icon, muted), null, null);
         navigation.setCompoundDrawablePadding(dp(4));
         navigation.setTextSize(12);
-        navigation.setPadding(dp(4), dp(6), dp(4), dp(6));
+        navigation.setPadding(0, dp(6), 0, dp(6));
         navigation.setMinimumHeight(dp(56));
         navigation.setOnClickListener(view -> {
             if (navigationTab(screen) != destination && AppPreferences.navigationHapticsEnabled(this)) {
@@ -913,6 +929,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_DISCOVER_SUBMISSION) {
+            profileScreen.onSubmissionFilePicked(resultCode == RESULT_OK && data != null ? data.getData() : null);
+            return;
+        }
         if (requestCode == PICK_PRIVATE_MUSIC) {
             String owner = pendingUploadOwner;
             pendingUploadOwner = null;
@@ -1033,6 +1053,7 @@ public final class MainActivity extends Activity {
             adapter.notifyDataSetChanged();
             playlistPage.trackAdapter.notifyDataSetChanged();
             playlistPage.playlistAdapter.notifyDataSetChanged();
+            profileScreen.bindPublishedRows();
         }
     }
 
@@ -1209,6 +1230,7 @@ public final class MainActivity extends Activity {
             playlistPage.trackAdapter.notifyDataSetChanged();
             discoverScreen.trackAdapter.notifyDataSetChanged();
             discoverScreen.bindQuickPickRows();
+            profileScreen.bindPublishedRows();
         }
         miniPlayer.setVisibility(current == null || keyboardOpen ? View.GONE : View.VISIBLE);
         Bitmap artwork = current == null ? null : playback.currentArtwork();
@@ -1393,13 +1415,14 @@ public final class MainActivity extends Activity {
             playlistPage.setVisibility(target == Screen.PLAYLISTS ? View.VISIBLE : View.GONE);
             discoverScreen.setVisibility(target == Screen.DISCOVER ? View.VISIBLE : View.GONE);
             settingsScreen.setVisibility(target == Screen.SETTINGS ? View.VISIBLE : View.GONE);
+            profileScreen.setVisibility(target == Screen.PROFILE ? View.VISIBLE : View.GONE);
             recentlyDeletedPage.setVisibility(target == Screen.RECENTLY_DELETED ? View.VISIBLE : View.GONE);
             if (target == Screen.RECENTLY_DELETED) {
                 recentlyDeletedPage.refresh();
             }
             if (target == Screen.DISCOVER) {
                 discoverScreen.open();
-            } else if (target == Screen.SETTINGS) {
+            } else if (target == Screen.SETTINGS || target == Screen.PROFILE) {
                 discoverScreen.refreshAccount();
             }
             Screen selectedTab = navigationTab(target);
@@ -1467,7 +1490,6 @@ public final class MainActivity extends Activity {
     private final class DiscoverPage extends LinearLayout {
         private static final int QUICK_PICK_ROWS_PER_COLUMN = 4;
         private static final int QUICK_PICK_LIMIT = 3 * QUICK_PICK_ROWS_PER_COLUMN;
-        private enum Load { IDLE, LOADING, READY, ERROR }
         private enum Section { BROWSE, ALL, ALBUM, LIKED, UPLOADS }
 
         private record AlbumKey(String name, String artist) {
@@ -1781,7 +1803,7 @@ public final class MainActivity extends Activity {
         }
 
         void toggleAccount() {
-            if (accountBusy || uploading || !DiscoverBackend.signInConfigured()) {
+            if (accountBusy || uploading || profileScreen.submitting || !DiscoverBackend.signInConfigured()) {
                 return;
             }
             if (account == null) {
@@ -1854,6 +1876,9 @@ public final class MainActivity extends Activity {
                     loadUploads();
                 }
             }
+            if (screen == Screen.PROFILE && account != null) {
+                profileScreen.loadPublishedTracks();
+            }
             render();
         }
 
@@ -1870,6 +1895,7 @@ public final class MainActivity extends Activity {
                 pendingLikes.clear();
                 likesState = Load.IDLE;
                 uploadsState = Load.IDLE;
+                profileScreen.clearPublishedTracks();
             }
             account = next;
         }
@@ -2262,21 +2288,426 @@ public final class MainActivity extends Activity {
         }
 
         private void renderAccount() {
+            boolean configured = DiscoverBackend.signInConfigured();
+            int message = 0;
             if (accountBusy) {
-                accountStatus.setText(R.string.loading);
-            } else if (!DiscoverBackend.signInConfigured()) {
-                accountStatus.setText(R.string.account_setup_needed);
+                message = R.string.loading;
+            } else if (!configured) {
+                message = R.string.account_setup_needed;
             } else if (accountError != 0) {
-                accountStatus.setText(accountError);
+                message = accountError;
             } else if (account == null) {
-                accountStatus.setText(R.string.account_signed_out);
+                message = R.string.account_signed_out;
+            }
+            if (message != 0) {
+                accountStatus.setText(message);
             } else {
                 accountStatus.setText(account.email().isEmpty() ? getString(R.string.account_signed_in) : account.email());
             }
-            accountAction.setText(account == null ? R.string.google_sign_in : R.string.sign_out);
-            accountAction.setVisibility(DiscoverBackend.signInConfigured() ? View.VISIBLE : View.GONE);
-            MainActivity.setEnabled(accountAction, !accountBusy && !uploading);
+            updateAccountAction(accountAction, configured);
+            if (screen == Screen.PROFILE || account == null) {
+                profileScreen.render(account, message, configured, !accountBusy && !uploading);
+            }
             renderPlayerArtworkAction(playback == null ? null : playback.currentTrack());
+        }
+
+        private void updateAccountAction(Button button, boolean configured) {
+            button.setText(account == null ? R.string.google_sign_in : R.string.sign_out);
+            button.setVisibility(configured ? View.VISIBLE : View.GONE);
+            MainActivity.setEnabled(button, !accountBusy && !uploading && !profileScreen.submitting);
+        }
+    }
+
+    private final class ProfileBanner extends View {
+        private static final int[] WAVEFORM = {
+                0, 3, -4, 5, -7, 2, 12, -16, 8, -9, 24, -28, 14, -7, 12,
+                -17, 8, -5, 9, -12, 5, -15, 19, -22, 11, -8, 4, -5, 14, -10,
+                7, -19, 32, -24, 15, -5, 9, -7, 4, -3, 0
+        };
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+        private Shader backdrop;
+
+        ProfileBanner() {
+            super(MainActivity.this);
+            setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        }
+
+        @Override protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+            super.onSizeChanged(width, height, oldWidth, oldHeight);
+            if (width > 0 && height > 0) {
+                int base = darkMode ? PLAYER : accentSurface;
+                backdrop = new LinearGradient(0, 0, width, height, base, surface, Shader.TileMode.CLAMP);
+            }
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float width = getWidth();
+            float height = getHeight();
+            paint.setColor(accentSurface);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setShader(backdrop);
+            canvas.drawRect(0, 0, width, height, paint);
+            paint.setShader(null);
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setColor(accent);
+            paint.setAlpha(27);
+            paint.setStrokeWidth(dp(1));
+            for (int index = 0; index < 6; index++) {
+                float offset = index * height / 11f;
+                path.rewind();
+                path.moveTo(0, offset - height * 0.18f);
+                path.cubicTo(width * 0.26f, offset + height * 0.58f,
+                        width * 0.69f, offset - height * 0.32f, width, offset + height * 0.22f);
+                canvas.drawPath(path, paint);
+            }
+
+            paint.setColor(accent);
+            paint.setStrokeWidth(dp(2));
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+            float left = width * 0.20f;
+            float spacing = width * 0.60f / (WAVEFORM.length - 1);
+            float center = height * 0.45f;
+            path.rewind();
+            path.moveTo(left, center);
+            for (int index = 1; index < WAVEFORM.length; index++) {
+                path.lineTo(left + spacing * index, center + height * WAVEFORM[index] / 145f);
+            }
+            canvas.drawPath(path, paint);
+        }
+    }
+
+    private final class ProfilePage extends FrameLayout {
+        private final ScrollView scroll;
+        private final LinearLayout hero;
+        private final FrameLayout compactHeader;
+        private final TextView compactName;
+        private final ImageView avatar;
+        private final TextView name;
+        private final TextView status;
+        private final Button action;
+        private final Button submit;
+        private final TextView submissionStatus;
+        private final LinearLayout publishedSection;
+        private final LinearLayout publishedRows;
+        private final TextView publishedMessage;
+        private final Button publishedRetry;
+        private List<Track> publishedTracks = Collections.emptyList();
+        private Load publishedState = Load.IDLE;
+        private DiscoverBackend.Account avatarAccount;
+        private Future<?> avatarRequest;
+        private String submissionPickerOwner;
+        private boolean submitting;
+
+        ProfilePage() {
+            super(MainActivity.this);
+            scroll = new ScrollView(MainActivity.this);
+            scroll.setFillViewport(true);
+            addView(scroll, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+            LinearLayout page = column();
+            page.setPadding(0, 0, 0, dp(24));
+            scroll.addView(page);
+
+            hero = column();
+            hero.setBackgroundColor(surface);
+            page.addView(hero, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            FrameLayout artwork = new FrameLayout(MainActivity.this);
+            hero.addView(artwork, new LinearLayout.LayoutParams(MATCH_PARENT, dp(184)));
+            artwork.addView(new ProfileBanner(), new FrameLayout.LayoutParams(MATCH_PARENT, dp(148)));
+
+            FrameLayout avatarBorder = new FrameLayout(MainActivity.this);
+            avatarBorder.setBackground(round(surface, 42));
+            avatarBorder.setPadding(dp(4), dp(4), dp(4), dp(4));
+            FrameLayout.LayoutParams avatarPosition = new FrameLayout.LayoutParams(dp(84), dp(84),
+                    Gravity.BOTTOM | Gravity.START);
+            avatarPosition.setMarginStart(dp(16));
+            artwork.addView(avatarBorder, avatarPosition);
+            avatar = artworkTile(accentSurface, 38);
+            displayArtwork(avatar, null, R.drawable.ic_profile, accent, 22);
+            avatarBorder.addView(avatar, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+
+            LinearLayout details = column();
+            details.setPadding(dp(20), dp(8), dp(20), dp(16));
+            hero.addView(details, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            LinearLayout identity = new LinearLayout(MainActivity.this);
+            identity.setGravity(Gravity.CENTER_VERTICAL);
+            details.addView(identity, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            name = text(R.string.profile, 26, ink, true);
+            name.setMaxLines(2);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            markHeading(name);
+            identity.addView(name, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+
+            submit = button(R.string.submit_music, onAccent, accent);
+            submit.setMinHeight(dp(48));
+            submit.setMaxWidth(dp(148));
+            submit.setOnClickListener(view -> pickSubmissionFile());
+            LinearLayout.LayoutParams submitSize = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
+            submitSize.setMarginStart(dp(12));
+            identity.addView(submit, submitSize);
+
+            status = text(R.string.account_signed_out, 15, muted, false);
+            status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+            addWithMargin(details, status, MATCH_PARENT, WRAP_CONTENT, 10);
+            action = button(R.string.google_sign_in, onAccent, accent);
+            action.setMinHeight(dp(48));
+            action.setOnClickListener(view -> {
+                if (discoverScreen.account == null) {
+                    discoverScreen.signIn();
+                }
+            });
+            addWithMargin(details, action, WRAP_CONTENT, WRAP_CONTENT, 12);
+
+            submissionStatus = text(R.string.submission_help, 14, muted, false);
+            submissionStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+            addWithMargin(details, submissionStatus, MATCH_PARENT, WRAP_CONTENT, 12);
+
+            publishedSection = column();
+            publishedSection.setPadding(dp(20), dp(20), dp(20), 0);
+            page.addView(publishedSection, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            TextView publishedTitle = text(R.string.profile_published_tracks, 20, ink, true);
+            markHeading(publishedTitle);
+            publishedSection.addView(publishedTitle);
+            publishedMessage = text(0, 15, muted, false);
+            publishedMessage.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+            addWithMargin(publishedSection, publishedMessage, MATCH_PARENT, WRAP_CONTENT, 8);
+            publishedRetry = button(R.string.retry, accent, accentSurface);
+            publishedRetry.setMinHeight(dp(48));
+            publishedRetry.setOnClickListener(view -> loadPublishedTracks());
+            addWithMargin(publishedSection, publishedRetry, WRAP_CONTENT, WRAP_CONTENT, 8);
+            publishedRows = column();
+            addWithMargin(publishedSection, publishedRows, MATCH_PARENT, WRAP_CONTENT, 8);
+
+            compactName = singleLineText(16, ink, true);
+            compactHeader = screenHeader(compactName);
+            compactHeader.setBackgroundColor(surface);
+            compactHeader.setClickable(true);
+            compactHeader.setVisibility(View.GONE);
+            addView(compactHeader, new FrameLayout.LayoutParams(MATCH_PARENT, dp(52), Gravity.TOP));
+            scroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> updateCompactHeader());
+            hero.addOnLayoutChangeListener((view, left, top, right, bottom,
+                    oldLeft, oldTop, oldRight, oldBottom) -> updateCompactHeader());
+
+            submit.setVisibility(View.GONE);
+            submissionStatus.setVisibility(View.GONE);
+            publishedSection.setVisibility(View.GONE);
+        }
+
+        void render(DiscoverBackend.Account account, int message, boolean configured, boolean ready) {
+            boolean hasDisplayName = account != null && !account.displayName().isEmpty()
+                    && !account.displayName().equalsIgnoreCase(account.email());
+            name.setText(hasDisplayName ? account.displayName() : getText(R.string.profile));
+            if (account == null && !submitting) {
+                submissionStatus.setText(R.string.submission_help);
+            }
+            submit.setVisibility(account == null ? View.GONE : View.VISIBLE);
+            submissionStatus.setVisibility(account == null ? View.GONE : View.VISIBLE);
+            MainActivity.setEnabled(submit, ready && !submitting && submissionPickerOwner == null);
+            publishedSection.setVisibility(account == null ? View.GONE : View.VISIBLE);
+            renderPublishedStatus();
+            status.setVisibility(message == 0 ? View.GONE : View.VISIBLE);
+            if (message != 0) {
+                status.setText(message);
+            }
+            action.setVisibility(account == null && configured ? View.VISIBLE : View.GONE);
+            MainActivity.setEnabled(action, ready && !submitting);
+            compactName.setText(name.getText());
+            updateCompactHeader();
+            bindAvatar(account);
+        }
+
+        private void updateCompactHeader() {
+            boolean collapsed = hero.getHeight() > 0 && scroll.getScrollY() > 0
+                    && scroll.getScrollY() >= hero.getBottom() - dp(52);
+            compactHeader.setVisibility(collapsed ? View.VISIBLE : View.GONE);
+        }
+
+        void loadPublishedTracks() {
+            DiscoverBackend.Account account = discoverScreen.account;
+            if (account == null || publishedState == Load.LOADING) {
+                return;
+            }
+            int generation = discoverScreen.accountGeneration;
+            publishedState = Load.LOADING;
+            renderPublishedStatus();
+            discoverScreen.backend.publishedTracks(account.id(), result -> {
+                if (isDestroyed() || generation != discoverScreen.accountGeneration) {
+                    return;
+                }
+                publishedState = result.success() ? Load.READY : Load.ERROR;
+                if (result.success()) {
+                    showPublishedTracks(result.value());
+                }
+                renderPublishedStatus();
+            });
+        }
+
+        void clearPublishedTracks() {
+            publishedState = Load.IDLE;
+            showPublishedTracks(Collections.emptyList());
+            scroll.scrollTo(0, 0);
+        }
+
+        private void showPublishedTracks(List<Track> tracks) {
+            if (publishedTracks.equals(tracks)) {
+                return;
+            }
+            for (int index = 0; index < publishedRows.getChildCount(); index++) {
+                TrackRow row = (TrackRow) publishedRows.getChildAt(index);
+                if (row.artworkRequest != null) {
+                    row.artworkRequest.cancel(false);
+                }
+                row.artworkVersion++;
+            }
+            publishedRows.removeAllViews();
+            publishedTracks = tracks;
+            for (Track track : tracks) {
+                TrackRow row = new TrackRow();
+                row.setFocusable(true);
+                row.setOnClickListener(view -> selectTrack(publishedTracks, track, null));
+                publishedRows.addView(row, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            }
+            bindPublishedRows();
+        }
+
+        void bindPublishedRows() {
+            for (int index = 0; index < publishedTracks.size(); index++) {
+                ((TrackRow) publishedRows.getChildAt(index)).bind(publishedTracks.get(index));
+            }
+        }
+
+        private void renderPublishedStatus() {
+            int label = 0;
+            if (publishedState == Load.LOADING && publishedTracks.isEmpty()) {
+                label = R.string.loading;
+            } else if (publishedState == Load.ERROR) {
+                label = R.string.profile_published_error;
+            } else if (publishedState == Load.READY && publishedTracks.isEmpty()) {
+                label = R.string.profile_published_empty;
+            }
+            publishedMessage.setVisibility(label == 0 ? View.GONE : View.VISIBLE);
+            if (label != 0) {
+                publishedMessage.setText(label);
+            }
+            publishedRetry.setVisibility(publishedState == Load.ERROR ? View.VISIBLE : View.GONE);
+        }
+
+        private void pickSubmissionFile() {
+            DiscoverBackend.Account account = discoverScreen.account;
+            if (account == null || submitting || submissionPickerOwner != null) {
+                return;
+            }
+            Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("audio/*").putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"audio/mpeg", "audio/mp3"});
+            try {
+                submissionPickerOwner = account.id();
+                discoverScreen.renderAccount();
+                startActivityForResult(picker, PICK_DISCOVER_SUBMISSION);
+            } catch (ActivityNotFoundException error) {
+                submissionPickerOwner = null;
+                discoverScreen.renderAccount();
+                Toast.makeText(MainActivity.this, R.string.picker_error, Toast.LENGTH_SHORT).show();
+            }
+        }
+
+        void saveSubmissionPicker(Bundle state) {
+            state.putString("submissionOwner", submissionPickerOwner);
+        }
+
+        void restoreSubmissionPicker(Bundle state) {
+            submissionPickerOwner = state.getString("submissionOwner");
+        }
+
+        void onSubmissionFilePicked(Uri document) {
+            String owner = submissionPickerOwner;
+            submissionPickerOwner = null;
+            discoverScreen.renderAccount();
+            if (owner != null && document != null) {
+                openSubmissionForm(document, owner);
+            }
+        }
+
+        private void openSubmissionForm(Uri document, String owner) {
+            MasheedsDialog dialog = new MasheedsDialog(MainActivity.this, getText(R.string.submit_music));
+            EditText title = dialog.addInput(R.string.submission_title, "");
+            title.setFilters(new InputFilter[]{new InputFilter.LengthFilter(200)});
+            EditText artist = dialog.addInput(R.string.submission_artist, "");
+            artist.setFilters(new InputFilter[]{new InputFilter.LengthFilter(200)});
+            title.requestFocus();
+            dialog.addCancel();
+            dialog.addAction(R.string.submission_send_for_review, true, () -> {
+                String trackName = title.getText().toString().trim();
+                String artistName = artist.getText().toString().trim();
+                if (trackName.isEmpty()) {
+                    title.setError(getText(R.string.submission_required));
+                    title.requestFocus();
+                    return;
+                }
+                if (artistName.isEmpty()) {
+                    artist.setError(getText(R.string.submission_required));
+                    artist.requestFocus();
+                    return;
+                }
+                dialog.dismiss();
+                submitTrack(document, owner, trackName, artistName);
+            });
+            dialog.show();
+        }
+
+        private void submitTrack(Uri document, String owner, String title, String artist) {
+            submitting = true;
+            submissionStatus.setText(R.string.upload_preparing);
+            discoverScreen.renderAccount();
+            PrivateMusicTransfer.submitForReview(MainActivity.this, document, owner, title, artist, percent -> {
+                        if (!isDestroyed()) {
+                            submissionStatus.setText(percent == 100 ? getText(R.string.upload_verifying)
+                                    : getString(R.string.upload_percent, percent));
+                        }
+                    }, code -> {
+                        if (isDestroyed()) {
+                            return;
+                        }
+                        submitting = false;
+                        int result = code == null ? R.string.submission_sent : switch (code) {
+                            case "invalid_size" -> R.string.submission_size_error;
+                            case "invalid_type", "invalid_audio" -> R.string.submission_type_error;
+                            case "submission_account_limit" -> R.string.submission_account_limit;
+                            case "submission_queue_full", "submission_in_review" -> R.string.submission_wait;
+                            case "submission_setup_needed" -> R.string.submission_setup_needed;
+                            default -> R.string.submission_error;
+                        };
+                        submissionStatus.setText(result);
+                        discoverScreen.renderAccount();
+                        if (screen != Screen.PROFILE) {
+                            Toast.makeText(MainActivity.this, result, Toast.LENGTH_SHORT).show();
+                        }
+                    });
+        }
+
+        private void bindAvatar(DiscoverBackend.Account account) {
+            if (Objects.equals(avatarAccount, account)) {
+                return;
+            }
+            cancelAvatarRequest();
+            avatarAccount = account;
+            displayArtwork(avatar, null, R.drawable.ic_profile, accent, 22);
+            if (account != null && account.avatarUri() != null) {
+                avatarRequest = ArtworkLoader.loadRemote(account.avatarUri(), dp(88), bitmap -> {
+                    if (!isDestroyed() && avatarAccount == account && bitmap != null) {
+                        displayArtwork(avatar, bitmap, R.drawable.ic_profile, accent, 22);
+                    }
+                });
+            }
+        }
+
+        void cancelAvatarRequest() {
+            if (avatarRequest != null) {
+                avatarRequest.cancel(true);
+                avatarRequest = null;
+            }
         }
     }
 

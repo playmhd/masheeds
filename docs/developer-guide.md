@@ -39,6 +39,14 @@ Local playback is available in builds without the Discover configuration.
 
 Run `pwsh -File ./tools/update-discover-cache.ps1` to check cache headers and range responses for published MP3s in the project's `discover` bucket. Add `-Apply` to update their cache lifetime in place and verify their SHA-256 checksums. The script prompts for the project's existing server-side secret key without echoing it.
 
+## Discover submissions and profiles
+
+After the catalog and albums migrations, apply the [Discover submissions migration](../supabase/migrations/20261111172357_discover_submissions.sql) and the [published track owners migration](../supabase/migrations/20261112231515_discover_published_track_owners.sql).
+
+Signed-in listeners can submit an MP3 up to 10 MiB from Profile with a track name and artist or reciter. Uploads stay in the private review queue. For a self-hosted backend, handle review and publication server-side. Use the submission ID as the approved catalog track ID so the database records who submitted it before the queue entry is cleared.
+
+Profile shows only the signed-in user's tracks that are currently published in Discover. The owners migration recovers older links where the original submission record still exists.
+
 ## Optional private uploads
 
 Private uploads are disabled by default. Keep Masheeds on the Supabase Free plan and leave Cloudflare R2 disabled for a $0 deployment. Supabase can restrict online features if the project exceeds its Free quotas. [Supabase cost controls](https://supabase.com/docs/guides/platform/cost-control)

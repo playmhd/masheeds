@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <permission android:name="com.masheeds.player.permission.REVIEWER_SIGN_IN"
+        android:protectionLevel="signature" />
 
     <application
         android:allowBackup="false"
@@ -25,6 +27,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".ReviewerSignInActivity" android:exported="true"
+            android:permission="com.masheeds.player.permission.REVIEWER_SIGN_IN" />
         <service
             android:name=".PlaybackService"
             android:exported="false"

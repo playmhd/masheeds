@@ -1,4 +1,4 @@
-package com.masheeds.player;
+package com.masheeds.shared;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -17,7 +17,7 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
-final class DiscoverTokenStore {
+public final class SecureTokenStore {
     private static final String KEY_ALIAS = "masheeds.discover.session";
     private static final String REFRESH_TOKEN = "refresh_token";
     private static final int IV_SIZE = 12;
@@ -25,12 +25,12 @@ final class DiscoverTokenStore {
     private final SharedPreferences preferences;
     private final byte[] project;
 
-    DiscoverTokenStore(Context context, String projectUrl) {
+    public SecureTokenStore(Context context, String projectUrl) {
         preferences = context.getSharedPreferences("discover_session", Context.MODE_PRIVATE);
         project = projectUrl.getBytes(StandardCharsets.UTF_8);
     }
 
-    String read() {
+    public String read() {
         String saved = preferences.getString(REFRESH_TOKEN, null);
         if (saved == null) {
             return null;
@@ -50,7 +50,7 @@ final class DiscoverTokenStore {
         }
     }
 
-    void save(String token) throws GeneralSecurityException, IOException {
+    public void save(String token) throws GeneralSecurityException, IOException {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
         cipher.updateAAD(project);
@@ -66,7 +66,7 @@ final class DiscoverTokenStore {
         }
     }
 
-    void clear() {
+    public void clear() {
         preferences.edit().remove(REFRESH_TOKEN).apply();
     }
 

@@ -14,7 +14,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.net.URL;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -25,6 +28,7 @@ import javax.net.ssl.HttpsURLConnection;
 
 final class PrivateMusicTransfer {
     private static final long MAX_BYTES = 20_000_000L;
+    private static final long SUBMISSION_MAX_BYTES = 10L * 1024 * 1024;
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
@@ -39,7 +43,7 @@ final class PrivateMusicTransfer {
         WORKER.execute(() -> {
             Audio audio;
             try {
-                audio = prepare(app, document);
+                audio = prepare(app, document, MAX_BYTES, false);
             } catch (InvalidFile error) {
                 MAIN.post(() -> completed.accept(error.code));
                 return;
@@ -76,12 +80,52 @@ final class PrivateMusicTransfer {
         });
     }
 
-    private static Audio prepare(Context context, Uri document) throws IOException {
+    static void submitForReview(Context context, Uri document, String owner, String title, String artist,
+                                IntConsumer progress, Consumer<String> completed) {
+        Context app = context.getApplicationContext();
+        WORKER.execute(() -> {
+            Audio audio;
+            try {
+                audio = prepare(app, document, SUBMISSION_MAX_BYTES, true);
+            } catch (InvalidFile error) {
+                MAIN.post(() -> completed.accept(error.code));
+                return;
+            } catch (IOException | RuntimeException error) {
+                MAIN.post(() -> completed.accept("upload_failed"));
+                return;
+            }
+            String hash;
+            try {
+                hash = sha256(audio.file());
+            } catch (IOException | NoSuchAlgorithmException error) {
+                audio.file().delete();
+                MAIN.post(() -> completed.accept("upload_failed"));
+                return;
+            }
+            DiscoverBackend.get(app).submitMusic(owner, audio, title, artist, hash, progress, result -> {
+                audio.file().delete();
+                completed.accept(result.success() ? null : result.code());
+            });
+        });
+    }
+
+    private static String sha256(File file) throws IOException, NoSuchAlgorithmException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new FileInputStream(file)) {
+            byte[] buffer = new byte[64 * 1024];
+            for (int count; (count = input.read(buffer)) != -1; ) {
+                digest.update(buffer, 0, count);
+            }
+        }
+        return String.format(Locale.ROOT, "%064x", new BigInteger(1, digest.digest()));
+    }
+
+    private static Audio prepare(Context context, Uri document, long maxBytes, boolean mp3Only) throws IOException {
         String name = displayName(context, document);
         String lower = name.toLowerCase(Locale.ROOT);
         String mime = lower.endsWith(".mp3") ? "audio/mpeg"
                 : lower.endsWith(".m4a") ? "audio/mp4" : null;
-        if (mime == null) {
+        if (mime == null || mp3Only && !"audio/mpeg".equals(mime)) {
             throw new InvalidFile("invalid_type");
         }
         File temp = File.createTempFile("masheeds-upload-", lower.endsWith(".mp3") ? ".mp3" : ".m4a",
@@ -97,7 +141,7 @@ final class PrivateMusicTransfer {
                 long size = 0;
                 for (int count; (count = input.read(buffer)) != -1; ) {
                     size += count;
-                    if (size > MAX_BYTES) {
+                    if (size > maxBytes) {
                         throw new InvalidFile("invalid_size");
                     }
                     output.write(buffer, 0, count);
@@ -122,6 +166,10 @@ final class PrivateMusicTransfer {
                 if (embeddedDuration != null) {
                     duration = (int) Math.max(0, Math.min(86_400_000, Long.parseLong(embeddedDuration)));
                 }
+                if (mp3Only && !"audio/mpeg".equals(metadata.extractMetadata(
+                        MediaMetadataRetriever.METADATA_KEY_MIMETYPE))) {
+                    throw new InvalidFile("invalid_audio");
+                }
             } catch (RuntimeException ignored) {
                 // Server-side format verification decides whether the file is playable.
             } finally {
@@ -130,6 +178,9 @@ final class PrivateMusicTransfer {
                 } catch (IOException ignored) {
                     // Metadata already read is still usable.
                 }
+            }
+            if (mp3Only && duration <= 0) {
+                throw new InvalidFile("invalid_audio");
             }
             if (title.isEmpty()) {
                 title = context.getString(R.string.untitled_track);
@@ -172,24 +223,8 @@ final class PrivateMusicTransfer {
             connection.setConnectTimeout(15_000);
             connection.setReadTimeout(25_000);
             connection.setRequestMethod("PUT");
-            connection.setDoOutput(true);
-            connection.setFixedLengthStreamingMode(grant.size());
-            connection.setRequestProperty("Content-Type", grant.mime());
             connection.setRequestProperty("If-None-Match", "*");
-            try (InputStream input = new FileInputStream(audio.file()); OutputStream output = connection.getOutputStream()) {
-                byte[] buffer = new byte[64 * 1024];
-                long written = 0;
-                int previous = -1;
-                for (int count; (count = input.read(buffer)) != -1; ) {
-                    output.write(buffer, 0, count);
-                    written += count;
-                    int percent = (int) (written * 100 / grant.size());
-                    if (percent != previous) {
-                        previous = percent;
-                        MAIN.post(() -> progress.accept(percent));
-                    }
-                }
-            }
+            writeAudio(connection, audio, progress);
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) {
                 throw new IOException("R2 upload failed");
@@ -197,6 +232,27 @@ final class PrivateMusicTransfer {
         } finally {
             MAIN.removeCallbacks(deadline);
             connection.disconnect();
+        }
+    }
+
+    static void writeAudio(HttpsURLConnection connection, Audio audio, IntConsumer progress) throws IOException {
+        long size = audio.file().length();
+        connection.setDoOutput(true);
+        connection.setFixedLengthStreamingMode(size);
+        connection.setRequestProperty("Content-Type", audio.mime());
+        try (InputStream input = new FileInputStream(audio.file()); OutputStream output = connection.getOutputStream()) {
+            byte[] buffer = new byte[64 * 1024];
+            long written = 0;
+            int previous = -1;
+            for (int count; (count = input.read(buffer)) != -1; ) {
+                output.write(buffer, 0, count);
+                written += count;
+                int percent = (int) (written * 100 / size);
+                if (percent != previous) {
+                    previous = percent;
+                    MAIN.post(() -> progress.accept(percent));
+                }
+            }
         }
     }
 

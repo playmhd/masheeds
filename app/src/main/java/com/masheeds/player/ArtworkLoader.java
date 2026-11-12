@@ -73,6 +73,13 @@ final class ArtworkLoader {
         });
     }
 
+    static Future<?> loadRemote(Uri uri, int size, Consumer<Bitmap> onLoaded) {
+        return ONLINE_WORKERS.submit(() -> {
+            Bitmap bitmap = readOnlineArtwork(uri, size);
+            MAIN.post(() -> onLoaded.accept(bitmap));
+        });
+    }
+
     private static Bitmap read(Context context, Track track, int size) {
         if (track.isOnline()) {
             return readOnlineArtwork(track.artworkUri(), size);

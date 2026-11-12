@@ -8,6 +8,7 @@ import android.os.SystemClock;
 import android.util.AtomicFile;
 
 import com.masheeds.player.TrackLibrary.Track;
+import com.masheeds.shared.SecureTokenStore;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -30,6 +31,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 
 import javax.net.ssl.HttpsURLConnection;
 
@@ -43,7 +45,7 @@ final class DiscoverBackend {
     private static final String KEY = BuildConfig.SUPABASE_PUBLISHABLE_KEY;
     private static DiscoverBackend instance;
 
-    record Account(String id, String email) {}
+    record Account(String id, String email, String displayName, Uri avatarUri) {}
     record Result<T>(T value, boolean success, String code) {}
     record CatalogSnapshot(List<Track> tracks, long savedAt) {
         boolean fresh() { return youngerThan(CATALOG_FRESH_MS); }
@@ -59,12 +61,14 @@ final class DiscoverBackend {
     record UploadGrant(String id, Uri url, long size, String mime) {}
     record PlaybackGrant(Uri url, int expiresIn) {}
     private record Session(Account account, String accessToken, String refreshToken, long expiresAt) {}
+    private record SubmissionUpload(int slot, String accessToken) {}
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService catalogWorker = Executors.newSingleThreadExecutor();
     // Refresh token rotation, likes and sign-out share one worker across activity instances.
     private final ExecutorService accountWorker = Executors.newSingleThreadExecutor();
-    private final DiscoverTokenStore tokens;
+    private final ExecutorService submissionWorker = Executors.newSingleThreadExecutor();
+    private final SecureTokenStore tokens;
     private final AtomicFile catalogFile;
     private volatile CatalogSnapshot cachedCatalog;
     private boolean catalogCacheRead;
@@ -72,7 +76,7 @@ final class DiscoverBackend {
 
     private DiscoverBackend(Context context) {
         Context app = context.getApplicationContext();
-        tokens = new DiscoverTokenStore(app, BASE);
+        tokens = new SecureTokenStore(app, BASE);
         catalogFile = new AtomicFile(new File(app.getCacheDir(), "discover-catalog-v1.json"));
     }
 
@@ -190,6 +194,27 @@ final class DiscoverBackend {
         }, callback);
     }
 
+    void publishedTracks(String accountId, Consumer<Result<List<Track>>> callback) {
+        run(accountWorker, () -> {
+            LinkedHashMap<String, Track> tracks = new LinkedHashMap<>();
+            for (int offset = 0; ; offset += PAGE_SIZE) {
+                String path = "/rest/v1/discover_my_published_tracks"
+                        + "?select=id,title,artist,album,duration_ms,audio_url,artwork_url"
+                        + "&order=published_at.desc,id.asc&limit=" + PAGE_SIZE + "&offset=" + offset;
+                JSONArray page = new JSONArray(authorized(accountId, "GET", path, null, null));
+                for (int index = 0; index < page.length(); index++) {
+                    Track track = readTrack(page.getJSONObject(index));
+                    if (track != null) {
+                        tracks.put(track.onlineId(), track);
+                    }
+                }
+                if (page.length() < PAGE_SIZE) {
+                    return new ArrayList<>(tracks.values());
+                }
+            }
+        }, callback);
+    }
+
     void signIn(String idToken, String nonce, Consumer<Result<Account>> callback) {
         run(accountWorker, () -> exchange("id_token", new JSONObject()
                 .put("provider", "google").put("id_token", idToken).put("nonce", nonce)).account(), callback);
@@ -274,6 +299,69 @@ final class DiscoverBackend {
         }, callback);
     }
 
+    void submitMusic(String accountId, PrivateMusicTransfer.Audio audio, String title, String artist,
+                     String hash, IntConsumer progress, Consumer<Result<Void>> callback) {
+        run(accountWorker, () -> {
+            // The reservation API still requires a source value for older clients and the review queue.
+            JSONObject data = new JSONObject().put("track_title", title).put("track_artist", artist)
+                    .put("track_source", "Not provided").put("track_duration", audio.duration())
+                    .put("track_size", audio.file().length()).put("track_sha256", hash);
+            JSONObject reservation;
+            try {
+                reservation = new JSONObject(authorized(accountId, "POST",
+                        "/rest/v1/rpc/reserve_discover_submission", data, null));
+            } catch (HttpError error) {
+                if (error.status == 404) {
+                    throw new HttpError(404, "submission_setup_needed");
+                }
+                throw error;
+            }
+            String error = reservation.optString("error");
+            if (!error.isEmpty()) {
+                throw new HttpError(409, error);
+            }
+            if (reservation.getBoolean("uploaded")) {
+                return null;
+            }
+            int slot = reservation.getInt("slot");
+            if (slot < 1 || slot > 30) {
+                throw new IOException("Invalid submission slot");
+            }
+            return new SubmissionUpload(slot, requireAccount(session(false), accountId).accessToken());
+        }, reservation -> {
+            if (!reservation.success() || reservation.value() == null) {
+                callback.accept(new Result<>(null, reservation.success(), reservation.code()));
+                return;
+            }
+            run(submissionWorker, () -> {
+                uploadSubmission(audio, reservation.value(), progress);
+                return null;
+            }, callback);
+        });
+    }
+
+    private void uploadSubmission(PrivateMusicTransfer.Audio audio, SubmissionUpload submission,
+                                  IntConsumer progress) throws IOException {
+        HttpsURLConnection connection = open(new URL(BASE + "/storage/v1/object/discover-submissions/"
+                + submission.slot() + ".mp3"));
+        Runnable deadline = connection::disconnect;
+        main.postDelayed(deadline, 120_000L);
+        try {
+            connection.setRequestMethod("POST");
+            connection.setRequestProperty("apikey", KEY);
+            connection.setRequestProperty("Authorization", "Bearer " + submission.accessToken());
+            connection.setRequestProperty("x-upsert", "false");
+            PrivateMusicTransfer.writeAudio(connection, audio, progress);
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                throw new HttpError(status, errorCode(connection));
+            }
+        } finally {
+            main.removeCallbacks(deadline);
+            connection.disconnect();
+        }
+    }
+
     void finishPrivateUpload(String accountId, String id, Consumer<Result<Void>> callback) {
         run(accountWorker, () -> {
             privateMusic(accountId, new JSONObject().put("action", "finish").put("id", id));
@@ -313,6 +401,7 @@ final class DiscoverBackend {
 
     private String authorized(String accountId, String method, String path, JSONObject body, String prefer)
             throws Exception {
+
         Session active = requireAccount(session(false), accountId);
         try {
             return request(method, path, active.accessToken(), body, prefer);
@@ -354,14 +443,40 @@ final class DiscoverBackend {
     private Session exchange(String grant, JSONObject body) throws Exception {
         JSONObject response = new JSONObject(request("POST", "/auth/v1/token?grant_type=" + grant,
                 null, body, null));
-        JSONObject user = response.getJSONObject("user");
-        Account account = new Account(user.getString("id"), user.optString("email"));
+        Account account = readAccount(response.getJSONObject("user"));
         long expiresAt = SystemClock.elapsedRealtime() + Math.max(0L, response.getInt("expires_in") - 30L) * 1000;
         Session next = new Session(account, response.getString("access_token"),
                 response.getString("refresh_token"), expiresAt);
         tokens.save(next.refreshToken());
         session = next;
         return next;
+    }
+
+    private static Account readAccount(JSONObject user) throws JSONException {
+        JSONObject profile = user.optJSONObject("user_metadata");
+        // Profile metadata is display-only. Likes and uploads use the authenticated user ID.
+        String name = profileText(profile, "full_name");
+        if (name.isEmpty()) {
+            name = profileText(profile, "name");
+        }
+        Uri avatar = googleAvatar(profileText(profile, "avatar_url"));
+        if (avatar == null) {
+            avatar = googleAvatar(profileText(profile, "picture"));
+        }
+        return new Account(user.getString("id"), profileText(user, "email"), name, avatar);
+    }
+
+    private static String profileText(JSONObject object, String key) {
+        return object != null && object.opt(key) instanceof String value ? value.trim() : "";
+    }
+
+    private static Uri googleAvatar(String value) {
+        Uri uri = httpsUri(value);
+        if (uri != null && uri.getHost().endsWith(".googleusercontent.com")
+                && (uri.getPort() == -1 || uri.getPort() == 443)) {
+            return uri;
+        }
+        return null;
     }
 
     private void clearSession() {
@@ -392,6 +507,7 @@ final class DiscoverBackend {
 
     private static String request(String method, String path, String token, JSONObject body, String prefer)
             throws IOException {
+
         if (!configured()) {
             throw new IOException("Discover is not configured");
         }
