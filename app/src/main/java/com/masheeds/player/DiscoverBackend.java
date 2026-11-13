@@ -46,8 +46,10 @@ final class DiscoverBackend {
     private static DiscoverBackend instance;
 
     record Account(String id, String email, String displayName, Uri avatarUri) {}
+    record OnlinePlaylist(String id, String name, List<String> trackIds, long revision) {}
+    record PublishedTracks(List<Track> tracks, Set<String> pendingDeletion) {}
     record Result<T>(T value, boolean success, String code) {}
-    record CatalogSnapshot(List<Track> tracks, long savedAt) {
+    record CatalogSnapshot(List<Track> tracks, long savedAt, boolean fetched) {
         boolean fresh() { return youngerThan(CATALOG_FRESH_MS); }
         boolean usable() { return youngerThan(CATALOG_MAX_AGE_MS); }
         long millisUntilStale() { return Math.max(1L, CATALOG_FRESH_MS - (System.currentTimeMillis() - savedAt)); }
@@ -61,7 +63,7 @@ final class DiscoverBackend {
     record UploadGrant(String id, Uri url, long size, String mime) {}
     record PlaybackGrant(Uri url, int expiresIn) {}
     private record Session(Account account, String accessToken, String refreshToken, long expiresAt) {}
-    private record SubmissionUpload(int slot, String accessToken) {}
+    private record SubmissionUpload(int slot, String accessToken, boolean audioUploaded, boolean thumbnailUploaded) {}
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService catalogWorker = Executors.newSingleThreadExecutor();
@@ -116,7 +118,8 @@ final class DiscoverBackend {
             LinkedHashMap<String, Track> tracks = new LinkedHashMap<>();
             for (int offset = 0; ; offset += PAGE_SIZE) {
                 String path = "/rest/v1/discover_tracks?published=eq.true"
-                        + "&select=id,title,artist,album,duration_ms,audio_url,artwork_url"
+                        + "&select=id,title,artist,album,duration_ms,audio_url,artwork_url,published_at,collection,"
+                        + "search_aliases,download_allowed"
                         + "&order=published_at.desc,id.asc&limit=" + PAGE_SIZE + "&offset=" + offset;
                 JSONArray page = new JSONArray(request("GET", path, null, null, null));
                 for (int index = 0; index < page.length(); index++) {
@@ -127,8 +130,8 @@ final class DiscoverBackend {
                 }
                 if (page.length() < PAGE_SIZE) {
                     CatalogSnapshot current = new CatalogSnapshot(new ArrayList<>(tracks.values()),
-                            System.currentTimeMillis());
-                    cachedCatalog = current;
+                            System.currentTimeMillis(), true);
+                    cachedCatalog = new CatalogSnapshot(current.tracks(), current.savedAt(), false);
                     writeCatalogCache(current);
                     return current;
                 }
@@ -151,7 +154,7 @@ final class DiscoverBackend {
                             tracks.add(track);
                         }
                     }
-                    cachedCatalog = new CatalogSnapshot(tracks, document.getLong("saved_at"));
+                    cachedCatalog = new CatalogSnapshot(tracks, document.getLong("saved_at"), false);
                 }
             } catch (IOException | JSONException ignored) {
                 // The catalog can be fetched when the cache is unavailable.
@@ -165,11 +168,7 @@ final class DiscoverBackend {
         try {
             JSONArray rows = new JSONArray();
             for (Track track : snapshot.tracks()) {
-                rows.put(new JSONObject().put("id", track.onlineId()).put("title", track.title())
-                        .put("artist", track.artist()).put("duration_ms", track.duration())
-                        .put("album", track.album())
-                        .put("audio_url", track.uri().toString())
-                        .put("artwork_url", track.artworkUri() == null ? null : track.artworkUri().toString()));
+                rows.put(trackJson(track));
             }
             byte[] bytes = new JSONObject().put("project", BASE).put("saved_at", snapshot.savedAt())
                     .put("tracks", rows).toString().getBytes(StandardCharsets.UTF_8);
@@ -194,30 +193,110 @@ final class DiscoverBackend {
         }, callback);
     }
 
-    void publishedTracks(String accountId, Consumer<Result<List<Track>>> callback) {
+    void publishedTracks(String accountId, Consumer<Result<PublishedTracks>> callback) {
         run(accountWorker, () -> {
             LinkedHashMap<String, Track> tracks = new LinkedHashMap<>();
+            Set<String> pendingDeletion = new LinkedHashSet<>();
             for (int offset = 0; ; offset += PAGE_SIZE) {
-                String path = "/rest/v1/discover_my_published_tracks"
-                        + "?select=id,title,artist,album,duration_ms,audio_url,artwork_url"
+                String path = "/rest/v1/discover_my_managed_tracks"
+                        + "?select=id,title,artist,album,duration_ms,audio_url,artwork_url,published_at,collection,"
+                        + "search_aliases,download_allowed,owner_deleting"
                         + "&order=published_at.desc,id.asc&limit=" + PAGE_SIZE + "&offset=" + offset;
                 JSONArray page = new JSONArray(authorized(accountId, "GET", path, null, null));
                 for (int index = 0; index < page.length(); index++) {
-                    Track track = readTrack(page.getJSONObject(index));
+                    JSONObject row = page.getJSONObject(index);
+                    Track track = readTrack(row);
                     if (track != null) {
                         tracks.put(track.onlineId(), track);
+                        if (row.optBoolean("owner_deleting")) {
+                            pendingDeletion.add(track.onlineId());
+                        }
                     }
                 }
                 if (page.length() < PAGE_SIZE) {
-                    return new ArrayList<>(tracks.values());
+                    return new PublishedTracks(new ArrayList<>(tracks.values()), pendingDeletion);
                 }
             }
         }, callback);
     }
 
+    void deletePublishedTrack(String accountId, String id, Consumer<Result<Boolean>> callback) {
+        run(accountWorker, () -> {
+            JSONObject result = new JSONObject(authorized(accountId, "POST", "/functions/v1/discover-delete",
+                    new JSONObject().put("id", id), null));
+            return result.getBoolean("pending");
+        }, result -> {
+            if (!result.success()) {
+                callback.accept(result);
+                return;
+            }
+            run(catalogWorker, () -> {
+                CatalogSnapshot saved = readCatalogCache();
+                if (saved != null) {
+                    List<Track> tracks = new ArrayList<>(saved.tracks());
+                    tracks.removeIf(track -> id.equals(track.onlineId()));
+                    cachedCatalog = new CatalogSnapshot(tracks, saved.savedAt(), false);
+                    writeCatalogCache(cachedCatalog);
+                }
+                return null;
+            }, ignored -> callback.accept(result));
+        });
+    }
+
     void signIn(String idToken, String nonce, Consumer<Result<Account>> callback) {
         run(accountWorker, () -> exchange("id_token", new JSONObject()
                 .put("provider", "google").put("id_token", idToken).put("nonce", nonce)).account(), callback);
+    }
+
+    void onlinePlaylists(String accountId, Consumer<Result<List<OnlinePlaylist>>> callback) {
+        run(accountWorker, () -> {
+            List<OnlinePlaylist> playlists = new ArrayList<>();
+            for (int offset = 0; ; offset += PAGE_SIZE) {
+                JSONArray rows = new JSONArray(authorized(accountId, "GET",
+                        "/rest/v1/discover_playlists?select=id,name,track_ids,revision&order=name,id"
+                                + "&limit=" + PAGE_SIZE + "&offset=" + offset, null, null));
+                for (int index = 0; index < rows.length(); index++) {
+                    playlists.add(readOnlinePlaylist(rows.getJSONObject(index)));
+                }
+                if (rows.length() < PAGE_SIZE) {
+                    return playlists;
+                }
+            }
+        }, callback);
+    }
+
+    void writeOnlinePlaylist(String accountId, OnlinePlaylist playlist, boolean create, boolean delete,
+                             Consumer<Result<OnlinePlaylist>> callback) {
+        run(accountWorker, () -> {
+            String path = "/rest/v1/discover_playlists?select=id,name,track_ids,revision";
+            JSONObject body = null;
+            if (!delete) {
+                body = new JSONObject().put("name", playlist.name()).put("track_ids", new JSONArray(playlist.trackIds()));
+            }
+            if (create) {
+                body.put("id", playlist.id());
+            } else {
+                path += "&id=eq." + Uri.encode(playlist.id()) + "&revision=eq." + playlist.revision();
+                if (!delete) {
+                    body.put("revision", playlist.revision() + 1);
+                }
+            }
+            JSONArray rows = new JSONArray(authorized(accountId, create ? "POST" : delete ? "DELETE" : "PATCH",
+                    path, body, "return=representation"));
+            if (rows.length() != 1) {
+                throw new HttpError(409, "playlist_conflict");
+            }
+            return readOnlinePlaylist(rows.getJSONObject(0));
+        }, callback);
+    }
+
+    private static OnlinePlaylist readOnlinePlaylist(JSONObject row) throws JSONException {
+        List<String> ids = new ArrayList<>();
+        JSONArray tracks = row.getJSONArray("track_ids");
+        for (int index = 0; index < tracks.length(); index++) {
+            ids.add(tracks.getString(index));
+        }
+        return new OnlinePlaylist(row.getString("id"), row.getString("name"), ids, row.getLong("revision"));
     }
 
     void signOut(Consumer<Result<Void>> callback) {
@@ -300,12 +379,16 @@ final class DiscoverBackend {
     }
 
     void submitMusic(String accountId, PrivateMusicTransfer.Audio audio, String title, String artist,
-                     String hash, IntConsumer progress, Consumer<Result<Void>> callback) {
+                     String hash, PrivateMusicTransfer.Thumbnail thumbnail, IntConsumer progress,
+                     Consumer<Result<Void>> callback) {
         run(accountWorker, () -> {
             // The reservation API still requires a source value for older clients and the review queue.
             JSONObject data = new JSONObject().put("track_title", title).put("track_artist", artist)
                     .put("track_source", "Not provided").put("track_duration", audio.duration())
                     .put("track_size", audio.file().length()).put("track_sha256", hash);
+            if (thumbnail != null) {
+                data.put("cover_size", thumbnail.jpeg().length).put("cover_sha256", thumbnail.sha256());
+            }
             JSONObject reservation;
             try {
                 reservation = new JSONObject(authorized(accountId, "POST",
@@ -320,30 +403,45 @@ final class DiscoverBackend {
             if (!error.isEmpty()) {
                 throw new HttpError(409, error);
             }
-            if (reservation.getBoolean("uploaded")) {
+            boolean audioUploaded = reservation.getBoolean("uploaded");
+            boolean thumbnailUploaded = thumbnail == null || reservation.getBoolean("thumbnail_uploaded");
+            if (audioUploaded && thumbnailUploaded) {
                 return null;
             }
             int slot = reservation.getInt("slot");
             if (slot < 1 || slot > 30) {
                 throw new IOException("Invalid submission slot");
             }
-            return new SubmissionUpload(slot, requireAccount(session(false), accountId).accessToken());
+            return new SubmissionUpload(slot, requireAccount(session(false), accountId).accessToken(),
+                    audioUploaded, thumbnailUploaded);
         }, reservation -> {
             if (!reservation.success() || reservation.value() == null) {
                 callback.accept(new Result<>(null, reservation.success(), reservation.code()));
                 return;
             }
             run(submissionWorker, () -> {
-                uploadSubmission(audio, reservation.value(), progress);
+                SubmissionUpload upload = reservation.value();
+                if (!upload.thumbnailUploaded()) {
+                    uploadSubmission(upload, "discover-submission-thumbnails/" + upload.slot() + ".jpg", connection -> {
+                        connection.setDoOutput(true);
+                        connection.setRequestProperty("Content-Type", "image/jpeg");
+                        connection.setFixedLengthStreamingMode(thumbnail.jpeg().length);
+                        try (OutputStream output = connection.getOutputStream()) {
+                            output.write(thumbnail.jpeg());
+                        }
+                    });
+                }
+                if (!upload.audioUploaded()) {
+                    uploadSubmission(upload, "discover-submissions/" + upload.slot() + ".mp3",
+                            connection -> PrivateMusicTransfer.writeAudio(connection, audio, progress));
+                }
                 return null;
             }, callback);
         });
     }
 
-    private void uploadSubmission(PrivateMusicTransfer.Audio audio, SubmissionUpload submission,
-                                  IntConsumer progress) throws IOException {
-        HttpsURLConnection connection = open(new URL(BASE + "/storage/v1/object/discover-submissions/"
-                + submission.slot() + ".mp3"));
+    private void uploadSubmission(SubmissionUpload submission, String path, SubmissionBody body) throws IOException {
+        HttpsURLConnection connection = open(new URL(BASE + "/storage/v1/object/" + path));
         Runnable deadline = connection::disconnect;
         main.postDelayed(deadline, 120_000L);
         try {
@@ -351,7 +449,7 @@ final class DiscoverBackend {
             connection.setRequestProperty("apikey", KEY);
             connection.setRequestProperty("Authorization", "Bearer " + submission.accessToken());
             connection.setRequestProperty("x-upsert", "false");
-            PrivateMusicTransfer.writeAudio(connection, audio, progress);
+            body.write(connection);
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) {
                 throw new HttpError(status, errorCode(connection));
@@ -360,6 +458,10 @@ final class DiscoverBackend {
             main.removeCallbacks(deadline);
             connection.disconnect();
         }
+    }
+
+    private interface SubmissionBody {
+        void write(HttpsURLConnection connection) throws IOException;
     }
 
     void finishPrivateUpload(String accountId, String id, Consumer<Result<Void>> callback) {
@@ -484,7 +586,17 @@ final class DiscoverBackend {
         tokens.clear();
     }
 
-    private static Track readTrack(JSONObject item) throws JSONException {
+    static JSONObject trackJson(Track track) throws JSONException {
+        return new JSONObject().put("id", track.onlineId()).put("title", track.title())
+                .put("artist", track.artist()).put("duration_ms", track.duration()).put("album", track.album())
+                .put("audio_url", track.uri().toString())
+                .put("artwork_url", track.artworkUri() == null ? null : track.artworkUri().toString())
+                .put("published_at_ms", track.publishedAt()).put("collection", track.collection())
+                .put("search_aliases", track.searchAliases())
+                .put("download_allowed", track.downloadAllowed());
+    }
+
+    static Track readTrack(JSONObject item) throws JSONException {
         String id;
         try {
             id = UUID.fromString(item.getString("id")).toString();
@@ -495,9 +607,19 @@ final class DiscoverBackend {
         if (audio == null) {
             return null;
         }
+        long publishedAt = item.optLong("published_at_ms");
+        if (item.has("published_at")) {
+            try {
+                publishedAt = java.time.OffsetDateTime.parse(item.getString("published_at")).toInstant().toEpochMilli();
+            } catch (java.time.format.DateTimeParseException ignored) {
+                // A missing date only excludes the track from the new releases shelf.
+            }
+        }
         return new Track(audio, Uri.parse("masheeds://discover/" + id), item.getString("title"),
                 item.optString("artist"), item.getLong("duration_ms"), 0, 0,
-                httpsUri(item.optString("artwork_url")), item.isNull("album") ? "" : item.getString("album").trim());
+                httpsUri(item.optString("artwork_url")), item.isNull("album") ? "" : item.getString("album").trim(),
+                publishedAt, item.optString("collection").trim(), item.optString("search_aliases").trim(),
+                item.optBoolean("download_allowed"));
     }
 
     private static Uri httpsUri(String value) {

@@ -31,8 +31,8 @@ android {
         applicationId 'com.masheeds.player'
         minSdk 26
         targetSdk 36
-        versionCode 9
-        versionName '1.4.4'
+        versionCode 19
+        versionName '1.5.4'
         buildConfigField 'String', 'SUPABASE_URL', publicConfig('SUPABASE_URL')
         buildConfigField 'String', 'SUPABASE_PUBLISHABLE_KEY', publicConfig('SUPABASE_PUBLISHABLE_KEY')
         buildConfigField 'String', 'GOOGLE_WEB_CLIENT_ID', publicConfig('GOOGLE_WEB_CLIENT_ID')

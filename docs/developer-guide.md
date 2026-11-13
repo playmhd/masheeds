@@ -43,9 +43,15 @@ Run `pwsh -File ./tools/update-discover-cache.ps1` to check cache headers and ra
 
 After the catalog and albums migrations, apply the [Discover submissions migration](../supabase/migrations/20261111172357_discover_submissions.sql) and the [published track owners migration](../supabase/migrations/20261112231515_discover_published_track_owners.sql).
 
-Signed-in listeners can submit an MP3 up to 10 MiB from Profile with a track name and artist or reciter. Uploads stay in the private review queue. For a self-hosted backend, handle review and publication server-side. Use the submission ID as the approved catalog track ID so the database records who submitted it before the queue entry is cleared.
+Signed-in listeners can submit an MP3 up to 10 MiB from Profile with a track name and artist or reciter. The form previews embedded artwork and lets users choose a replacement before sending. The MP3 and its thumbnail stay private until approval. The Masheeds Reviewer backend requires the review and thumbnail migrations before serving submissions with artwork. Use the submission ID as the approved catalog track ID so the database records who submitted it before the queue entry is cleared.
 
 Profile shows only the signed-in user's tracks that are currently published in Discover. The owners migration recovers older links where the original submission record still exists.
+
+## Discover catalog and synced playlists
+
+Apply the [catalog and playlists migration](../supabase/migrations/20261113001733_version_five_catalog_and_playlists.sql) after the published track owners migration. Synced playlists belong to the signed-in account and hold Discover track IDs. Local playlists can mix device files and Discover tracks.
+
+Set `collection` on reviewed catalog tracks to group them in Discover, and use `search_aliases` for alternate names and transliterations. Set `download_allowed` only when offline distribution is permitted and the MP3 is in this project's public Discover bucket. Android downloads only on unmetered Wi-Fi. A successful catalog refresh removes saved downloads that are no longer eligible.
 
 ## Optional private uploads
 

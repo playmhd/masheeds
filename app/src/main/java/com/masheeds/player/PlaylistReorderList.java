@@ -13,12 +13,11 @@ import android.widget.ListView;
 
 import java.util.function.BiConsumer;
 
-// The playlist screen supplies its existing adapter and saves each completed move.
+// The caller supplies the adapter and applies each completed move.
 @SuppressLint("ViewConstructor")
 final class PlaylistReorderList extends ListView {
-    private final BiConsumer<String, Integer> onMove;
+    private final BiConsumer<Integer, Integer> onMove;
     private final ValueAnimator previewAnimator = new ValueAnimator();
-    private String draggedTrackId;
     private int draggedPosition = INVALID_POSITION;
     private int draggedHeight;
     private int hovered = INVALID_POSITION;
@@ -28,7 +27,7 @@ final class PlaylistReorderList extends ListView {
 
     private final Runnable scrollWhileDragging = new Runnable() {
         @Override public void run() {
-            if (draggedTrackId != null && scrollDirection != 0 && canScrollList(scrollDirection)) {
+            if (draggedPosition != INVALID_POSITION && scrollDirection != 0 && canScrollList(scrollDirection)) {
                 scrollListBy(scrollDirection * dp(12));
                 setHovered(positionAt(dragY));
                 postDelayed(this, 32);
@@ -36,7 +35,7 @@ final class PlaylistReorderList extends ListView {
         }
     };
 
-    PlaylistReorderList(Context context, BiConsumer<String, Integer> onMove) {
+    PlaylistReorderList(Context context, BiConsumer<Integer, Integer> onMove) {
         super(context);
         this.onMove = onMove;
         previewAnimator.setDuration(150);
@@ -48,12 +47,11 @@ final class PlaylistReorderList extends ListView {
         setOnDragListener((view, event) -> handleDrag(event));
     }
 
-    boolean beginDrag(View row, View handle, String trackId) {
+    boolean beginDrag(View row, View handle) {
         int position = getPositionForView(row);
-        if (draggedTrackId != null || position == INVALID_POSITION) {
+        if (draggedPosition != INVALID_POSITION || position == INVALID_POSITION) {
             return false;
         }
-        draggedTrackId = trackId;
         draggedPosition = position;
         draggedHeight = row.getHeight() + getDividerHeight();
         previewPosition = position;
@@ -61,7 +59,9 @@ final class PlaylistReorderList extends ListView {
         View.DragShadowBuilder shadow = new View.DragShadowBuilder(row) {
             @Override public void onProvideShadowMetrics(Point size, Point touch) {
                 super.onProvideShadowMetrics(size, touch);
-                touch.set(handle.getLeft() + handle.getWidth() / 2, handle.getTop() + handle.getHeight() / 2);
+                if (handle != null) {
+                    touch.set(handle.getLeft() + handle.getWidth() / 2, handle.getTop() + handle.getHeight() / 2);
+                }
             }
         };
         if (row.startDragAndDrop(ClipData.newPlainText("", ""), shadow, this, 0)) {
@@ -73,11 +73,10 @@ final class PlaylistReorderList extends ListView {
     }
 
     void resetDrag() {
-        if (draggedTrackId == null) {
+        if (draggedPosition == INVALID_POSITION) {
             return;
         }
         previewAnimator.cancel();
-        draggedTrackId = null;
         draggedPosition = INVALID_POSITION;
         hovered = INVALID_POSITION;
         setScrollDirection(0);
@@ -85,7 +84,7 @@ final class PlaylistReorderList extends ListView {
     }
 
     private boolean handleDrag(DragEvent event) {
-        if (event.getLocalState() != this || draggedTrackId == null) {
+        if (event.getLocalState() != this || draggedPosition == INVALID_POSITION) {
             return false;
         }
         switch (event.getAction()) {
@@ -101,12 +100,12 @@ final class PlaylistReorderList extends ListView {
             }
             case DragEvent.ACTION_DROP -> {
                 int target = positionAt(event.getY());
-                String trackId = draggedTrackId;
+                int source = draggedPosition;
                 resetDrag();
                 if (target == INVALID_POSITION) {
                     return false;
                 }
-                onMove.accept(trackId, target);
+                onMove.accept(source, target);
             }
             case DragEvent.ACTION_DRAG_ENDED -> resetDrag();
         }
@@ -117,8 +116,8 @@ final class PlaylistReorderList extends ListView {
         int first = getFirstVisiblePosition();
         for (int index = 0; index < getChildCount(); index++) {
             View row = getChildAt(index);
+            int position = first + index;
             if (y < row.getTop() + row.getHeight() / 2f) {
-                int position = first + index;
                 return position > draggedPosition ? Math.max(first, position - 1) : position;
             }
         }

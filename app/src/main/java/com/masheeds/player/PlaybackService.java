@@ -307,9 +307,49 @@ public final class PlaybackService extends Service {
     }
 
     void play(List<Track> tracks, int selectedIndex, String playlistId) {
+        playAt(tracks, selectedIndex, playlistId, 0);
+    }
+
+    void playAt(List<Track> tracks, int selectedIndex, String playlistId, int position) {
         saveCheckpoint();
         queue.select(tracks, selectedIndex, playlistId);
-        load(true, 0);
+        load(true, position);
+    }
+
+    PlaybackQueue.Snapshot queueSnapshot() {
+        return queue.snapshot();
+    }
+
+    void playQueuedTrack(int position) {
+        if (queue.canJumpTo(position)) {
+            saveCheckpoint();
+            queue.jumpTo(position);
+            load(true, 0);
+        }
+    }
+
+    void playNext(Track track) {
+        if (currentTrack() == null) {
+            play(java.util.Collections.singletonList(track), 0, null);
+        } else if (queue.playNext(track)) {
+            publishState();
+        }
+    }
+
+    boolean moveQueuedTrack(int from, int to) {
+        boolean moved = queue.moveQueuedTrack(from, to);
+        if (moved) {
+            publishState();
+        }
+        return moved;
+    }
+
+    boolean removeUpcoming(int position) {
+        boolean removed = queue.removeUpcoming(position);
+        if (removed) {
+            publishState();
+        }
+        return removed;
     }
 
     void restore(List<Track> tracks, int selectedIndex, String playlistId, int position) {
@@ -433,7 +473,8 @@ public final class PlaybackService extends Service {
                 prepareTrack(track, grant.url());
             });
         } else {
-            prepareTrack(track, track.uri());
+            android.net.Uri offline = new OfflineTracks(this).source(track);
+            prepareTrack(track, offline == null ? track.uri() : offline);
         }
     }
 
@@ -498,7 +539,7 @@ public final class PlaybackService extends Service {
                 }
                 return true;
             });
-            if (track.isOnline()) {
+            if ("https".equals(source.getScheme())) {
                 newPlayer.setOnInfoListener((sourcePlayer, what, extra) -> {
                     if (sourcePlayer != player || (what != MediaPlayer.MEDIA_INFO_BUFFERING_START
                             && what != MediaPlayer.MEDIA_INFO_BUFFERING_END)) {
@@ -612,6 +653,7 @@ public final class PlaybackService extends Service {
             player.start();
             completed = false;
             queue.visitCurrent();
+            saveCheckpoint();
             handler.removeCallbacks(checkpointTick);
             handler.postDelayed(checkpointTick, CHECKPOINT_INTERVAL);
             publishState();
@@ -813,6 +855,9 @@ public final class PlaybackService extends Service {
             savedPosition = completed ? 0 : Math.max(0, position());
         } catch (IllegalStateException ignored) {
             return;
+        }
+        if (hasStartedSession && (completed || player.isPlaying() || savedPosition > 0)) {
+            ListeningHistory.save(this, track, savedPosition, duration());
         }
         if (track.isOnline()) {
             return;

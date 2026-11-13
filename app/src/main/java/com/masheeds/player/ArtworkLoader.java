@@ -113,7 +113,7 @@ final class ArtworkLoader {
         }
     }
 
-    private static Bitmap readEmbedded(Context context, Uri uri, int size) {
+    static Bitmap readEmbedded(Context context, Uri uri, int size) {
         MediaMetadataRetriever retriever = new MediaMetadataRetriever();
         try {
             retriever.setDataSource(context, uri);

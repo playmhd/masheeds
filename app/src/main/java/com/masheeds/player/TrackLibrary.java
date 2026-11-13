@@ -24,7 +24,13 @@ final class TrackLibrary {
     private static final String REMOVED_TRACKS = "removed_tracks";
 
     record Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified,
-                 Uri artworkUri, String album) {
+                 Uri artworkUri, String album, long publishedAt, String collection, String searchAliases,
+                 boolean downloadAllowed) {
+        Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified,
+              Uri artworkUri, String album) {
+            this(uri, libraryUri, title, artist, duration, albumId, modified, artworkUri, album, 0, "", "", false);
+        }
+
         Track(Uri uri, Uri libraryUri, String title, String artist, long duration, long albumId, long modified,
               Uri artworkUri) {
             this(uri, libraryUri, title, artist, duration, albumId, modified, artworkUri, "");

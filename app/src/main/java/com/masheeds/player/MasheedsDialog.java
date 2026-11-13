@@ -26,6 +26,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.RadioButton;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.function.IntConsumer;
@@ -47,6 +48,10 @@ final class MasheedsDialog extends Dialog {
     private final ColorStateList indicatorTint;
 
     MasheedsDialog(Context context, CharSequence title) {
+        this(context, title, false);
+    }
+
+    MasheedsDialog(Context context, CharSequence title, boolean scrollBody) {
         super(context);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setCanceledOnTouchOutside(true);
@@ -86,7 +91,14 @@ final class MasheedsDialog extends Dialog {
         body.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams bodySize = new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT);
         bodySize.topMargin = dp(6);
-        card.addView(body, bodySize);
+        if (scrollBody) {
+            ScrollView scroll = new ScrollView(context);
+            scroll.addView(body, new ScrollView.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+            bodySize.weight = 1;
+            card.addView(scroll, bodySize);
+        } else {
+            card.addView(body, bodySize);
+        }
 
         actions = new LinearLayout(context);
         actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
@@ -283,7 +295,7 @@ final class MasheedsDialog extends Dialog {
         choice.setBackground(new RippleDrawable(rippleColor, fill, rounded(Color.WHITE, 14)));
     }
 
-    private void addToBody(View view, int height) {
+    void addToBody(View view, int height) {
         LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(MATCH_PARENT, height);
         size.topMargin = dp(8);
         body.addView(view, size);

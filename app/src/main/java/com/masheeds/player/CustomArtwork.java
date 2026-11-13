@@ -83,7 +83,7 @@ final class CustomArtwork {
                         changed = !hasCover(app, key);
                     }
                 } else {
-                    write(app, key, decodeSelection(app.getContentResolver(), image));
+                    write(app, key, decodeSelection(app.getContentResolver(), image, ArtworkLoader.COVER_SIZE));
                     changed = true;
                 }
             } catch (IOException | RuntimeException | OutOfMemoryError ignored) {
@@ -147,8 +147,7 @@ final class CustomArtwork {
         }
     }
 
-    private static Bitmap decodeSelection(ContentResolver resolver, Uri uri) throws IOException {
-        int size = ArtworkLoader.COVER_SIZE;
+    static Bitmap decodeSelection(ContentResolver resolver, Uri uri, int size) throws IOException {
         if (Build.VERSION.SDK_INT >= 28) {
             return ImageDecoder.decodeBitmap(ImageDecoder.createSource(resolver, uri), (decoder, info, source) -> {
                 Size original = info.getSize();

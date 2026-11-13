@@ -2,12 +2,16 @@ package com.masheeds.player;
 
 import android.content.Context;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -29,10 +33,13 @@ import javax.net.ssl.HttpsURLConnection;
 final class PrivateMusicTransfer {
     private static final long MAX_BYTES = 20_000_000L;
     private static final long SUBMISSION_MAX_BYTES = 10L * 1024 * 1024;
+    private static final int SUBMISSION_THUMBNAIL_SIZE = 512;
+    private static final int SUBMISSION_THUMBNAIL_MAX_BYTES = 512 * 1024;
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     record Audio(File file, String mime, String title, String artist, int duration) {}
+    record Thumbnail(Bitmap preview, byte[] jpeg, String sha256) {}
 
     private PrivateMusicTransfer() {}
 
@@ -80,7 +87,36 @@ final class PrivateMusicTransfer {
         });
     }
 
-    static void submitForReview(Context context, Uri document, String owner, String title, String artist,
+    static void loadSubmissionThumbnail(Context context, Uri audio, Uri image, Consumer<Thumbnail> completed) {
+        Context app = context.getApplicationContext();
+        WORKER.execute(() -> {
+            Thumbnail thumbnail = null;
+            try {
+                Bitmap bitmap = image == null ? ArtworkLoader.readEmbedded(app, audio, SUBMISSION_THUMBNAIL_SIZE)
+                        : CustomArtwork.decodeSelection(app.getContentResolver(), image, SUBMISSION_THUMBNAIL_SIZE);
+                if (bitmap != null) {
+                    // Flatten transparency on a neutral background and discard original image metadata.
+                    Bitmap preview = Bitmap.createBitmap(bitmap.getWidth(), bitmap.getHeight(), Bitmap.Config.ARGB_8888);
+                    Canvas canvas = new Canvas(preview);
+                    canvas.drawColor(Color.WHITE);
+                    canvas.drawBitmap(bitmap, null, new android.graphics.Rect(0, 0, preview.getWidth(), preview.getHeight()), null);
+                    ByteArrayOutputStream output = new ByteArrayOutputStream();
+                    if (preview.compress(Bitmap.CompressFormat.JPEG, 85, output)
+                            && output.size() > 0 && output.size() <= SUBMISSION_THUMBNAIL_MAX_BYTES) {
+                        byte[] bytes = output.toByteArray();
+                        thumbnail = new Thumbnail(preview, bytes,
+                                formatHash(MessageDigest.getInstance("SHA-256").digest(bytes)));
+                    }
+                }
+            } catch (IOException | RuntimeException | NoSuchAlgorithmException | OutOfMemoryError ignored) {
+                // An unreadable custom image can be replaced in the form.
+            }
+            Thumbnail result = thumbnail;
+            MAIN.post(() -> completed.accept(result));
+        });
+    }
+
+    static void submitForReview(Context context, Uri document, String owner, String title, String artist, Thumbnail thumbnail,
                                 IntConsumer progress, Consumer<String> completed) {
         Context app = context.getApplicationContext();
         WORKER.execute(() -> {
@@ -102,7 +138,7 @@ final class PrivateMusicTransfer {
                 MAIN.post(() -> completed.accept("upload_failed"));
                 return;
             }
-            DiscoverBackend.get(app).submitMusic(owner, audio, title, artist, hash, progress, result -> {
+            DiscoverBackend.get(app).submitMusic(owner, audio, title, artist, hash, thumbnail, progress, result -> {
                 audio.file().delete();
                 completed.accept(result.success() ? null : result.code());
             });
@@ -117,7 +153,11 @@ final class PrivateMusicTransfer {
                 digest.update(buffer, 0, count);
             }
         }
-        return String.format(Locale.ROOT, "%064x", new BigInteger(1, digest.digest()));
+        return formatHash(digest.digest());
+    }
+
+    private static String formatHash(byte[] hash) {
+        return String.format(Locale.ROOT, "%064x", new BigInteger(1, hash));
     }
 
     private static Audio prepare(Context context, Uri document, long maxBytes, boolean mp3Only) throws IOException {

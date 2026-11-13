@@ -12,6 +12,12 @@ import java.util.Objects;
 import java.util.Set;
 
 final class PlaybackQueue {
+    record Snapshot(List<Track> tracks, int currentIndex) {
+        boolean canMove(int position) {
+            return currentIndex >= 0 && position >= 0 && position < tracks.size() && position != currentIndex;
+        }
+    }
+
     private List<Track> items = Collections.emptyList();
     private List<Track> sourceOrder = Collections.emptyList();
     private final Set<String> visited = new LinkedHashSet<>();
@@ -47,6 +53,76 @@ final class PlaybackQueue {
 
     boolean matches(List<Track> tracks, String source) {
         return Objects.equals(playlistId, source) && (source != null || sourceOrder.equals(tracks));
+    }
+
+    Snapshot snapshot() {
+        return new Snapshot(Collections.unmodifiableList(new ArrayList<>(items)), index);
+    }
+
+    boolean canJumpTo(int position) {
+        return index >= 0 && position >= 0 && position < items.size() && position != index;
+    }
+
+    boolean jumpTo(int position) {
+        if (!canJumpTo(position)) {
+            return false;
+        }
+        // A jump advances past the intervening tracks for this pass through the queue.
+        visitCurrent();
+        for (int skipped = index + 1; skipped < position; skipped++) {
+            visited.add(key(items.get(skipped)));
+        }
+        index = position;
+        return true;
+    }
+
+    boolean playNext(Track track) {
+        if (current() == null || key(current()).equals(key(track))) {
+            return false;
+        }
+        List<Track> order = new ArrayList<>(items);
+        List<Track> played = order.subList(0, index);
+        played.removeIf(item -> key(item).equals(key(track)));
+        index = played.size();
+        order.subList(index + 1, order.size()).removeIf(item -> key(item).equals(key(track)));
+        order.add(index + 1, track);
+        applyManualOrder(order);
+        return true;
+    }
+
+    boolean moveQueuedTrack(int from, int to) {
+        if (!canJumpTo(from) || to < 0 || to >= items.size() || from == to) {
+            return false;
+        }
+        List<Track> order = new ArrayList<>(items);
+        order.add(to, order.remove(from));
+        if (from < index && to >= index) {
+            index--;
+        } else if (from > index && to <= index) {
+            index++;
+        }
+        applyManualOrder(order);
+        visited.clear();
+        for (int position = 0; position <= index; position++) {
+            visited.add(key(order.get(position)));
+        }
+        return true;
+    }
+
+    boolean removeUpcoming(int position) {
+        if (index < 0 || position <= index || position >= items.size()) {
+            return false;
+        }
+        List<Track> order = new ArrayList<>(items);
+        order.remove(position);
+        applyManualOrder(order);
+        return true;
+    }
+
+    private void applyManualOrder(List<Track> order) {
+        items = order;
+        sourceOrder = new ArrayList<>(order);
+        playlistId = null;
     }
 
     void visitCurrent() {
